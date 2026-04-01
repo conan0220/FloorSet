@@ -460,34 +460,54 @@ class CachedShardIterableDataset(IterableDataset):
 
     def __init__(
         self,
-        cache_dir: Path,
-        shuffle:   bool = True,
-        seed:      int  = 42,
-        preload:   bool = False,
+        cache_dir:  Path,
+        shuffle:    bool      = True,
+        seed:       int       = 42,
+        preload:    bool      = False,
+        num_shards: int | None = None,
     ):
         self.cache_dir   = Path(cache_dir)
         self.shuffle     = shuffle
         self.seed        = seed
         self.preload     = preload
-        self.shard_files = sorted(self.cache_dir.glob("shard_*.pt"))
-        if not self.shard_files:
+
+        all_shards = sorted(self.cache_dir.glob("shard_*.pt"))
+        if not all_shards:
             raise FileNotFoundError(
                 f"No shard files found in {cache_dir}. "
                 "Run  python solution/data/build_cache.py  first."
             )
+        # Restrict to the first num_shards shards when specified
+        if num_shards is not None:
+            all_shards = all_shards[:num_shards]
+        self.shard_files = all_shards
 
         if preload:
-            print(f"[CachedShardIterableDataset] Preloading {len(self.shard_files)} shards into RAM...")
+            n = len(self.shard_files)
+            print(f"[CachedShardIterableDataset] Preloading {n} shards into RAM...")
             self._data: list = []
             for i, path in enumerate(self.shard_files, 1):
                 self._data.extend(torch.load(path, weights_only=False))
-                print(f"\r  {i}/{len(self.shard_files)} shards  ({len(self._data)} samples)", end="", flush=True)
+                print(f"\r  {i}/{n} shards  ({len(self._data)} samples)", end="", flush=True)
             print()
             self._total = len(self._data)
         else:
+            # Count samples by loading metadata; if num_shards was restricted,
+            # compute exact count by summing shard sizes.
             meta = torch.load(self.cache_dir / "meta.pt", weights_only=True)
-            self._total = meta["total_samples"]
-            self._data  = None
+            shard_size = meta["shard_size"]
+            full_total = meta["total_samples"]
+            n_full_shards = len(sorted(self.cache_dir.glob("shard_*.pt")))
+            if num_shards is None or len(self.shard_files) == n_full_shards:
+                self._total = full_total
+            else:
+                # Last shard may be smaller; estimate conservatively
+                last_shard_size = full_total - shard_size * (n_full_shards - 1)
+                if len(self.shard_files) < n_full_shards:
+                    self._total = shard_size * (len(self.shard_files) - 1) + min(shard_size, last_shard_size)
+                else:
+                    self._total = full_total
+            self._data = None
 
     def __len__(self) -> int:
         return self._total
@@ -519,12 +539,13 @@ class CachedShardIterableDataset(IterableDataset):
 
 
 def get_cached_training_dataloader(
-    cache_dir:   Path = CACHE_DIR,
-    batch_size:  int  = 1,
-    shuffle:     bool = True,
-    num_workers: int  = 2,
-    seed:        int  = 42,
-    preload:     bool = False,
+    cache_dir:   Path      = CACHE_DIR,
+    batch_size:  int       = 1,
+    shuffle:     bool      = True,
+    num_workers: int       = 2,
+    seed:        int       = 42,
+    preload:     bool      = False,
+    num_shards:  int | None = None,
 ):
     """
     DataLoader backed by the pre-computed shard cache.
@@ -541,7 +562,8 @@ def get_cached_training_dataloader(
         num_workers = 0
 
     dataset = CachedShardIterableDataset(
-        cache_dir=cache_dir, shuffle=shuffle, seed=seed, preload=preload,
+        cache_dir=cache_dir, shuffle=shuffle, seed=seed,
+        preload=preload, num_shards=num_shards,
     )
 
     def _identity_collate(batch):

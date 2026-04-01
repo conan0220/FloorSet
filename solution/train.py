@@ -30,7 +30,7 @@ sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
 
 from config import (
     BATCH_SIZE, MAX_EPOCHS, PATIENCE, LEARNING_RATE, WARMUP_STEPS,
-    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION, LAMBDA_OVERLAP,
+    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION, LAMBDA_OVERLAP, LAMBDA_BLOCK_AREA,
     VALIDATE_EVERY, VIZ_BLOCK_SIZES, RAW_FEATURE_DIM,
     LOGS_DIR, VIZ_DIR, CHECKPOINT_DIR, CONTEST_DIR,
     CACHE_DIR, CACHE_PRELOAD,
@@ -51,6 +51,7 @@ from loss.wirelength_loss import wirelength_loss
 from loss.area_loss      import area_loss
 from loss.violation_loss import violation_loss
 from loss.overlap_loss   import overlap_loss
+from loss.block_area_loss import block_area_loss
 
 
 # =============================================================================
@@ -203,17 +204,19 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
     # De-normalise for HPWL / area losses (raw pixel scale)
     pred_raw = pred_norm * crefs.view(-1, 1, 1)  # [B, k, 4]
 
-    l_coord   = coord_loss(pred_norm, gtn, cons)
-    l_wl      = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
-    l_area    = area_loss(pred_raw, abase)
-    l_viol    = violation_loss(pred_norm, gtn, cons)
-    l_overlap = overlap_loss(pred_norm)
+    l_coord      = coord_loss(pred_norm, gtn, cons)
+    l_wl         = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
+    l_area       = area_loss(pred_raw, abase)
+    l_viol       = violation_loss(pred_norm, gtn, cons)
+    l_overlap    = overlap_loss(pred_norm)
+    l_block_area = block_area_loss(pred_norm, tf, kpm)
 
     total = (l_coord
-             + LAMBDA_WIRELENGTH * l_wl
-             + LAMBDA_AREA       * l_area
-             + LAMBDA_VIOLATION  * l_viol
-             + LAMBDA_OVERLAP    * l_overlap)
+             + LAMBDA_WIRELENGTH  * l_wl
+             + LAMBDA_AREA        * l_area
+             + LAMBDA_VIOLATION   * l_viol
+             + LAMBDA_OVERLAP     * l_overlap
+             + LAMBDA_BLOCK_AREA  * l_block_area)
 
     return total, {
         "total":      total.item(),
@@ -222,6 +225,7 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
         "area":       l_area.item(),
         "violation":  l_viol.item(),
         "overlap":    l_overlap.item(),
+        "block_area": l_block_area.item(),
     }, pred_norm
 
 
@@ -373,17 +377,22 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
 
     pred_raw = pred_norm * ref   # [1, k, 4]
 
+    tf_feat = s["token_features"][:k].unsqueeze(0).to(device)   # [1, k, 18]
+    kpm     = torch.zeros(1, k, dtype=torch.bool, device=device) # no padding
+
     with torch.no_grad():
-        l_coord   = coord_loss(pred_norm, gtn, cons).item()
-        l_wl      = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
-        l_area    = area_loss(pred_raw, abase).item()
-        l_viol    = violation_loss(pred_norm, gtn, cons).item()
-        l_overlap = overlap_loss(pred_norm).item()
-        total     = (l_coord
-                     + LAMBDA_WIRELENGTH * l_wl
-                     + LAMBDA_AREA       * l_area
-                     + LAMBDA_VIOLATION  * l_viol
-                     + LAMBDA_OVERLAP    * l_overlap)
+        l_coord      = coord_loss(pred_norm, gtn, cons).item()
+        l_wl         = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
+        l_area       = area_loss(pred_raw, abase).item()
+        l_viol       = violation_loss(pred_norm, gtn, cons).item()
+        l_overlap    = overlap_loss(pred_norm).item()
+        l_block_area = block_area_loss(pred_norm, tf_feat, kpm).item()
+        total        = (l_coord
+                        + LAMBDA_WIRELENGTH  * l_wl
+                        + LAMBDA_AREA        * l_area
+                        + LAMBDA_VIOLATION   * l_viol
+                        + LAMBDA_OVERLAP     * l_overlap
+                        + LAMBDA_BLOCK_AREA  * l_block_area)
 
     return {
         "total":      total,
@@ -392,6 +401,7 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
         "area":       l_area,
         "violation":  l_viol,
         "overlap":    l_overlap,
+        "block_area": l_block_area,
     }
 
 
@@ -510,7 +520,8 @@ def _save_viz(gt_raw, pred_raw, epoch: int, block_count: int,
         f"wl={loss_parts['wirelength']:.4f}  "
         f"area={loss_parts['area']:.4f}  "
         f"viol={loss_parts['violation']:.4f}  "
-        f"overlap={loss_parts['overlap']:.4f}"
+        f"overlap={loss_parts['overlap']:.4f}  "
+        f"block_area={loss_parts['block_area']:.4f}"
     )
     fig.text(0.5, 0.01, loss_text, ha="center", va="bottom",
              fontsize=8, family="monospace",
@@ -527,7 +538,7 @@ def _save_viz(gt_raw, pred_raw, epoch: int, block_count: int,
 # Main training loop
 # =============================================================================
 
-def train(smoke_test: bool = False):
+def train(smoke_test: bool = False, num_shards: int | None = None):
     _make_dirs()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -569,7 +580,9 @@ def train(smoke_test: bool = False):
     # ── Data loader (prefer shard cache when available) ───────────────────
     _cache_ready = (CACHE_DIR / "meta.pt").exists() and not smoke_test
     if _cache_ready:
+        shard_info = f"{num_shards} shards" if num_shards else "all shards"
         print(f"Cache detected at {CACHE_DIR} — using CachedShardIterableDataset"
+              + f" ({shard_info})"
               + (" (preload into RAM)" if CACHE_PRELOAD else " (streaming from disk)"))
         train_loader = get_cached_training_dataloader(
             cache_dir=CACHE_DIR,
@@ -577,6 +590,7 @@ def train(smoke_test: bool = False):
             shuffle=True,
             num_workers=2,
             preload=CACHE_PRELOAD,
+            num_shards=num_shards,
         )
         _use_cache = True
     else:
@@ -624,6 +638,7 @@ def train(smoke_test: bool = False):
                 print(f"    area       = {loss_parts['area']}")
                 print(f"    violation  = {loss_parts['violation']}")
                 print(f"    overlap    = {loss_parts['overlap']}")
+                print(f"    block_area = {loss_parts['block_area']}")
                 print(f"    total      = {loss_parts['total']}")
                 print(f"    pred min/max/mean = {p.min().item():.4e} / {p.max().item():.4e} / {p.mean().item():.4e}"
                       f"  nan={torch.isnan(p).any().item()} inf={torch.isinf(p).any().item()}")
@@ -652,6 +667,7 @@ def train(smoke_test: bool = False):
                       f"  area={loss_parts['area']:.4f}"
                       f"  viol={loss_parts['violation']:.4f}"
                       f"  overlap={loss_parts['overlap']:.4f}"
+                      f"  block_area={loss_parts['block_area']:.4f}"
                       f"  lr={lr_now:.2e}")
 
         # ── Epoch-end logging ─────────────────────────────────────────────
@@ -706,5 +722,9 @@ if __name__ == "__main__":
         "--smoke-test", action="store_true",
         help="Run 2 batches × 2 epochs for quick validation"
     )
+    parser.add_argument(
+        "--num-shards", type=int, default=None,
+        help="Use only the first N cache shards (default: all)"
+    )
     args = parser.parse_args()
-    train(smoke_test=args.smoke_test)
+    train(smoke_test=args.smoke_test, num_shards=args.num_shards)

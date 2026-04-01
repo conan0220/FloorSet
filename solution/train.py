@@ -33,10 +33,13 @@ from config import (
     GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION,
     VALIDATE_EVERY, VIZ_BLOCK_SIZES, RAW_FEATURE_DIM,
     LOGS_DIR, VIZ_DIR, CHECKPOINT_DIR, CONTEST_DIR,
+    CACHE_DIR, CACHE_PRELOAD,
 )
 from data.floorset_loader import (
     preprocess_sample,
     get_training_dataloader,
+    get_cached_training_dataloader,
+    build_w_int_unnorm,
     count_valid_blocks,
     compute_canvas_ref,
     sort_block_indices,
@@ -59,34 +62,6 @@ def _make_dirs():
 
 
 # =============================================================================
-# Unnormalized w_int for wirelength loss
-# =============================================================================
-
-def _build_w_int_unnorm(
-    b2b_conn:    torch.Tensor,   # [n_edges, 3]  raw
-    block_count: int,
-    sort_idx:    torch.Tensor,   # [k]
-) -> torch.Tensor:
-    """
-    Dense unnormalized b2b weight matrix in sorted block order.
-    Same logic as build_w_int_dense but WITHOUT the normalization step.
-    """
-    w = torch.zeros(block_count, block_count)
-    valid = b2b_conn[:, 0] >= 0
-    edges = b2b_conn[valid].float()
-    if edges.numel() > 0:
-        bi = edges[:, 0].long()
-        bj = edges[:, 1].long()
-        wt = edges[:, 2]
-        in_range = (bi < block_count) & (bj < block_count)
-        bi, bj, wt = bi[in_range], bj[in_range], wt[in_range]
-        if bi.numel() > 0:
-            w.view(-1).scatter_add_(0, bi * block_count + bj, wt)
-            w = torch.maximum(w, w.t())
-    return w[sort_idx][:, sort_idx]
-
-
-# =============================================================================
 # Batch preprocessing
 # =============================================================================
 
@@ -105,7 +80,7 @@ def preprocess_raw_batch(raw_batch: tuple) -> list:
             area_target[i], b2b_conn[i], p2b_conn[i],
             pins_pos[i], constraints[i], fp_sol[i], metrics[i],
         )
-        s["w_int_unnorm"] = _build_w_int_unnorm(
+        s["w_int_unnorm"] = build_w_int_unnorm(
             b2b_conn[i], s["block_count"], s["sort_idx"]
         )
         samples.append(s)
@@ -313,19 +288,24 @@ def run_official_validation(epoch: int, log_file: Path, dry_run: bool = False) -
         sys.executable,
         str(CONTEST_DIR / "iccad2026_evaluate.py"),
         "--evaluate",
-        str(CONTEST_DIR / "my_optimizer.py"),
+        str(CONTEST_DIR / "my_optimizer.py")
     ]
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True, text=True,
-            cwd=str(_REPO_ROOT),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=str(_REPO_ROOT),
         )
-        output = result.stdout + (result.stderr if result.returncode != 0 else "")
+        lines = []
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            lines.append(line)
+        proc.wait()
+        output = "".join(lines)
     except Exception as e:
         output = f"[ERROR] Failed to run evaluator: {e}\n"
+        print(output, end="")
 
-    print(output, end="")
     with open(log_file, "a") as f:
         f.write(header + "\n" + output + "\n")
 
@@ -490,12 +470,29 @@ def train(smoke_test: bool = False):
         )
         print(f"Resumed from epoch {start_epoch}")
 
-    # ── Data loader ───────────────────────────────────────────────────────
-    train_loader = get_training_dataloader(
-        batch_size=batch_size_eff,
-        num_samples=(n_batches_cap * batch_size_eff) if n_batches_cap else None,
-        shuffle=not smoke_test,
-    )
+    # ── Data loader (prefer shard cache when available) ───────────────────
+    _cache_ready = (CACHE_DIR / "meta.pt").exists() and not smoke_test
+    if _cache_ready:
+        print(f"Cache detected at {CACHE_DIR} — using CachedShardIterableDataset"
+              + (" (preload into RAM)" if CACHE_PRELOAD else " (streaming from disk)"))
+        train_loader = get_cached_training_dataloader(
+            cache_dir=CACHE_DIR,
+            batch_size=batch_size_eff,
+            shuffle=True,
+            num_workers=2,
+            preload=CACHE_PRELOAD,
+        )
+        _use_cache = True
+    else:
+        if not smoke_test:
+            print("No cache found — running preprocessing on-the-fly")
+            print("Tip: run  python solution/data/build_cache.py  to build the cache")
+        train_loader = get_training_dataloader(
+            batch_size=batch_size_eff,
+            num_samples=(n_batches_cap * batch_size_eff) if n_batches_cap else None,
+            shuffle=not smoke_test,
+        )
+        _use_cache = False
 
     log_file = LOGS_DIR / "validation_log.txt"
     global_step = 0
@@ -514,8 +511,8 @@ def train(smoke_test: bool = False):
             if n_batches_cap is not None and batch_idx >= n_batches_cap:
                 break
 
-            # Preprocess
-            samples = preprocess_raw_batch(raw_batch)
+            # Preprocess (skip if samples already come from cache)
+            samples = raw_batch if _use_cache else preprocess_raw_batch(raw_batch)
             batch   = collate_samples(samples)
 
             # Forward + backward
@@ -574,6 +571,7 @@ def train(smoke_test: bool = False):
 
         # ── Validation every N epochs ─────────────────────────────────────
         if epoch % validate_every == 0:
+            visualize_predictions(model, epoch, device, dry_run=smoke_test)
             score = run_official_validation(
                 epoch, log_file, dry_run=smoke_test
             )
@@ -588,7 +586,7 @@ def train(smoke_test: bool = False):
                 no_improve_count += 1
                 print(f"  → no improvement ({no_improve_count}/{patience_eff})")
 
-            visualize_predictions(model, epoch, device, dry_run=smoke_test)
+            # visualize_predictions(model, epoch, device, dry_run=smoke_test)
 
             if no_improve_count >= patience_eff:
                 print(f"Early stopping: no improvement for {patience_eff} validations.")

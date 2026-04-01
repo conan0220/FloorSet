@@ -46,3 +46,7 @@ Thumbs.db
 
 # training dataset
 floorset_lite/
+
+# solution
+cache/
+logs/

@@ -15,6 +15,14 @@ CONTEST_DIR  = REPO_ROOT / "iccad2026contest"
 LOGS_DIR        = PROJECT_ROOT / "logs"
 VIZ_DIR         = LOGS_DIR / "viz"
 CHECKPOINT_DIR  = PROJECT_ROOT / "checkpoints"
+CACHE_DIR       = PROJECT_ROOT / "cache"
+
+# Number of preprocessed samples stored in each shard file
+SHARD_SIZE = 2000
+
+# Load entire cache into RAM at training startup (requires ~50 GB for 1 M samples).
+# Set True when RAM is sufficient; eliminates all disk I/O during training.
+CACHE_PRELOAD = True
 
 # =============================================================================
 # Data

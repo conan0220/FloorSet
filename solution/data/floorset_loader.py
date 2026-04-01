@@ -22,10 +22,12 @@ Output layout of preprocess_sample():
     metrics             [8]         float
 """
 
+import random
 import sys
 from pathlib import Path
 
 import torch
+from torch.utils.data import IterableDataset
 
 # Allow imports from repo root and iccad2026contest/
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -44,6 +46,8 @@ from config import (
     BOUNDARY_CODE_TO_IDX,
     BOUNDARY_DIM,
     RAW_FEATURE_DIM,
+    CACHE_DIR,
+    SHARD_SIZE,
 )
 
 _DATA_PATH = str(_REPO_ROOT) + "/"
@@ -404,6 +408,152 @@ def preprocess_sample(
         "area_baseline":      area_baseline,
         "metrics":            metrics.float(),       # [8]
     }
+
+
+# =============================================================================
+# W_int unnormalised (for wirelength loss — same as build_w_int_dense but
+# without the /max_w step so weights are in original scale)
+# =============================================================================
+
+def build_w_int_unnorm(
+    b2b_conn:    torch.Tensor,   # [n_edges, 3]
+    block_count: int,
+    sort_idx:    torch.Tensor,   # [k]
+) -> torch.Tensor:
+    """
+    Dense unnormalised b2b weight matrix in sorted block order.
+    Identical to build_w_int_dense but WITHOUT the normalisation step.
+    """
+    w = torch.zeros(block_count, block_count)
+    valid = b2b_conn[:, 0] >= 0
+    edges = b2b_conn[valid].float()
+    if edges.numel() > 0:
+        bi = edges[:, 0].long()
+        bj = edges[:, 1].long()
+        wt = edges[:, 2]
+        in_range = (bi < block_count) & (bj < block_count)
+        bi, bj, wt = bi[in_range], bj[in_range], wt[in_range]
+        if bi.numel() > 0:
+            w.view(-1).scatter_add_(0, bi * block_count + bj, wt)
+            w = torch.maximum(w, w.t())
+    return w[sort_idx][:, sort_idx]
+
+
+# =============================================================================
+# Shard-based cache: Dataset + DataLoader
+# =============================================================================
+
+class CachedShardIterableDataset(IterableDataset):
+    """
+    Streams preprocessed samples from shard files built by build_cache.py.
+
+    preload=False (default):
+        Loads one shard at a time from disk. Memory usage ≈ 1 shard (~100 MB).
+        Supports num_workers > 0 (each worker owns a disjoint subset of shards).
+
+    preload=True:
+        Loads ALL shards into RAM at __init__ time. After that, training never
+        touches the disk. Use this when RAM is large enough to hold the full
+        dataset (~50 GB for 1 M samples). num_workers must be 0 to avoid
+        duplicating the dataset across worker processes.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        shuffle:   bool = True,
+        seed:      int  = 42,
+        preload:   bool = False,
+    ):
+        self.cache_dir   = Path(cache_dir)
+        self.shuffle     = shuffle
+        self.seed        = seed
+        self.preload     = preload
+        self.shard_files = sorted(self.cache_dir.glob("shard_*.pt"))
+        if not self.shard_files:
+            raise FileNotFoundError(
+                f"No shard files found in {cache_dir}. "
+                "Run  python solution/data/build_cache.py  first."
+            )
+
+        if preload:
+            print(f"[CachedShardIterableDataset] Preloading {len(self.shard_files)} shards into RAM...")
+            self._data: list = []
+            for i, path in enumerate(self.shard_files, 1):
+                self._data.extend(torch.load(path, weights_only=False))
+                print(f"\r  {i}/{len(self.shard_files)} shards  ({len(self._data)} samples)", end="", flush=True)
+            print()
+            self._total = len(self._data)
+        else:
+            meta = torch.load(self.cache_dir / "meta.pt", weights_only=True)
+            self._total = meta["total_samples"]
+            self._data  = None
+
+    def __len__(self) -> int:
+        return self._total
+
+    def __iter__(self):
+        if self.preload:
+            # All data is in RAM — just shuffle and yield
+            data = list(self._data)
+            if self.shuffle:
+                random.shuffle(data)
+            yield from data
+        else:
+            worker_info  = torch.utils.data.get_worker_info()
+            shard_files  = list(self.shard_files)
+
+            # Split shards among DataLoader workers
+            if worker_info is not None:
+                shard_files = shard_files[worker_info.id :: worker_info.num_workers]
+
+            rng = random.Random(self.seed)
+            if self.shuffle:
+                rng.shuffle(shard_files)
+
+            for shard_path in shard_files:
+                shard: list = torch.load(shard_path, weights_only=False)
+                if self.shuffle:
+                    random.shuffle(shard)
+                yield from shard
+
+
+def get_cached_training_dataloader(
+    cache_dir:   Path = CACHE_DIR,
+    batch_size:  int  = 1,
+    shuffle:     bool = True,
+    num_workers: int  = 2,
+    seed:        int  = 42,
+    preload:     bool = False,
+):
+    """
+    DataLoader backed by the pre-computed shard cache.
+    Each iteration yields a *list* of sample dicts (length == batch_size).
+    Pass it directly to collate_samples() in train.py.
+
+    preload=True: loads all shards into RAM at startup (needs large RAM,
+                  forces num_workers=0 to avoid duplicating data).
+    """
+    from torch.utils.data import DataLoader
+
+    if preload and num_workers > 0:
+        print("[get_cached_training_dataloader] preload=True forces num_workers=0")
+        num_workers = 0
+
+    dataset = CachedShardIterableDataset(
+        cache_dir=cache_dir, shuffle=shuffle, seed=seed, preload=preload,
+    )
+
+    def _identity_collate(batch):
+        return batch   # list[dict], handed to collate_samples()
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=_identity_collate,
+        num_workers=num_workers,
+        pin_memory=False,
+    )
 
 
 # =============================================================================

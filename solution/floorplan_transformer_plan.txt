@@ -1,0 +1,487 @@
+================================================================================
+  純 Transformer Floorplan 專案計畫書
+  架構：Encoder-Decoder Transformer + 監督式學習
+  資料集：FloorSet-Lite（Intel / ICCAD 2026 Contest）
+================================================================================
+
+--------------------------------------------------------------------------------
+一、專案目標
+--------------------------------------------------------------------------------
+
+使用純 Transformer（Encoder-Decoder）架構，以監督式學習方式，
+訓練一個能夠自動完成 VLSI SoC Floorplanning 的模型。
+
+輸入：一組 block 的屬性、約束條件、以及 netlist 連接矩陣
+輸出：每個 block 的位置與尺寸 (x, y, w, h)，自回歸逐步生成
+
+訓練資料：FloorSet-Lite（1M 筆 optimal-by-construction 的 layout solution）
+評估指標：HPWL gap、Bounding box area gap、Soft constraint violation rate
+
+
+--------------------------------------------------------------------------------
+二、問題定義
+--------------------------------------------------------------------------------
+
+給定：
+  - k 個 blocks，每個 block 有面積目標與對應約束
+  - 兩個 netlist 矩陣：
+      W_int ∈ R^(k×k)：block 與 block 之間的連線權重
+      W_ext ∈ R^(k×r)：block 與 terminal 之間的連線權重
+  - r 個 terminals：固定在 canvas 邊界上的外部連接點
+
+輸出：
+  - 每個 block 的 (x, y, w, h)，座標原點在 canvas 左下角
+  - 所有 block 必須 overlap-free
+  - 盡可能滿足所有 soft constraints
+
+Block 類型（共 3 種）：
+  1. Soft Block      - 面積固定（1% 誤差內），寬高比可彈性調整
+  2. Fixed-shape     - 寬高 (w, h) 固定，位置彈性
+  3. Preplaced       - 位置 (x, y) 與寬高 (w, h) 全部固定
+
+Soft Constraints（共 5 種，違反有 penalty 但不直接造成 infeasible）：
+  1. Grouping        - 同組 block 必須實體相鄰（共享邊）
+  2. MIB             - 同組 block 必須有相同的 (w, h)
+  3. Boundary        - 指定 block 的某邊/角必須碰到 bounding box 邊界
+  4. Preplaced       - 位置偏離指定點算 violation
+  5. Fixed-shape     - 尺寸偏離指定值算 violation
+
+Hard Constraints（違反直接 infeasible，cost = 10）：
+  1. Overlap-free    - 任何兩個 block 不得重疊
+  2. Area tolerance  - Soft block 的 w*h 必須在 area_target 的 1% 誤差內
+
+
+--------------------------------------------------------------------------------
+三、模型架構
+--------------------------------------------------------------------------------
+
+【總覽】
+
+  所有 block token
+        │
+        ▼
+  ┌─────────────┐
+  │   Encoder   │  ← 理解所有 block 之間的關係
+  └─────────────┘
+        │ (cross-attention)
+        ▼
+  ┌─────────────┐
+  │   Decoder   │  ← 自回歸，逐步生成每個 block 的 (x, y, w, h)
+  └─────────────┘
+        │
+        ▼
+  Regression Head → (x, y, w, h)
+
+
+【3.1 Token Feature 設計（Encoder 輸入）】
+
+每個 block 對應一個 token vector，透過一個 Linear Projection 投影到 d_model（建議 256）。
+
+原始資料的 constraints 格式為 [n_blocks, 5]：
+  constraints[:, 0] = is_fixed_shape
+  constraints[:, 1] = is_preplaced
+  constraints[:, 2] = is_mib
+  constraints[:, 3] = is_cluster（grouping）
+  constraints[:, 4] = boundary_type（整數 bitmask，見下方說明）
+
+注意：原始資料只有 binary flag，沒有 group ID。
+  - 所有 is_mib == 1 的 block 視為同一組 MIB
+  - 所有 is_cluster == 1 的 block 視為同一組 grouping
+  - is_soft 由上述推導：is_soft = 1 - max(is_fixed_shape, is_preplaced)
+
+boundary_type 欄位說明（constraints[:, 4]）：
+  不是 binary flag，而是 bitmask 整數，共 9 種值：
+    0  → 無 boundary 約束（feature 填全零向量）
+    1  → Left
+    2  → Right
+    4  → Top
+    8  → Bottom
+    5  → Top-left   (= 4 | 1)
+    6  → Top-right  (= 4 | 2)
+    9  → Bottom-left  (= 8 | 1)
+    10 → Bottom-right (= 8 | 2)
+  編碼方式：轉為 8 維 one-hot（boundary_type），index 0~7 依序對應上表 1/2/4/8/5/6/9/10。
+
+固定尺寸與位置的資料來源（來自 fp_sol ground truth）：
+  target_w = fp_sol[:, 0]，target_h = fp_sol[:, 1]
+  target_x = fp_sol[:, 2]，target_y = fp_sol[:, 3]
+  非該類型的 block 填 0。
+
+原始 feature 包含（合計 1+3+2+2+8+1+1 = 18 維）：
+
+  # 面積資訊
+  area_target               (float, 1 維，正規化後)
+
+  # Block 類型（binary flags，直接來自 constraints）
+  is_soft                   (0 or 1)
+  is_fixed_shape            (0 or 1)
+  is_preplaced              (0 or 1)
+
+  # 固定尺寸資訊（fixed-shape / preplaced 才有意義，其他填 0）
+  target_w, target_h        (float, 2 維，正規化後，來自 fp_sol[:, 0:2])
+
+  # 固定位置資訊（preplaced 才有意義，其他填 0）
+  target_x, target_y        (float, 2 維，正規化後，來自 fp_sol[:, 2:4])
+
+  # Boundary constraint（8 維 one-hot，0 代表無約束時填全零）
+  boundary_type             (8 維)
+
+  # 其他 constraint flags（直接來自 constraints）
+  is_mib                    (0 or 1)
+  is_cluster                (0 or 1)
+
+  投影：
+  token_i = Linear(raw_feature_i) → d_model 維
+
+
+【3.2 Netlist Attention Bias】
+
+在 Encoder 的 Self-Attention 中加入 netlist bias，
+讓連線越強的 block 之間的 attention 越高：
+
+  Attention(Q, K, V)  →  QK^T / sqrt(d) + alpha * W_int[i][j]
+
+  alpha 為可學習的 scalar 係數
+  W_int[i][j] = 0 代表沒有連線，不影響 attention
+  W_int[i][j] 越大，代表越強的連線，bias 越大
+
+  此設計取代原本獨立的 GNN，讓 netlist 資訊自然融入 Transformer。
+
+
+【3.3 Encoder】
+
+  - 層數：6 層 Transformer Encoder layer
+  - d_model：256
+  - num_heads：8
+  - FFN 隱層：1024
+  - Dropout：0.1
+
+  輸入：k 個 token（每個 block 一個），加入 Netlist Attention Bias
+  輸出：k 個 contextual embedding，每個代表「考慮了所有 block 關係之後的 block 表示」
+
+
+【3.4 Decoder（自回歸）】
+
+放置順序（訓練與推論時固定）：
+  1. Preplaced blocks（位置最確定，先放）
+  2. Fixed-shape blocks
+  3. Soft blocks（最彈性，最後放）
+
+SOS Token（第一步的起始輸入）：
+  使用可學習的 embedding（nn.Parameter，形狀 [1, d_model]），
+  比全零向量更有彈性，讓模型學到「尚未放置任何 block」的表示。
+
+block_id 定義：
+  使用排序後的放置順序索引（0 ~ k-1）做 embedding（nn.Embedding(max_blocks, d_model)）。
+  即第幾個被放置的 block，不是原始 block index。
+  排序規則同放置順序：preplaced → fixed-shape → soft。
+
+每個時間步 t：
+  - 輸入：SOS token（t=0）或已放置 block 序列，
+          每個 token = Linear([x, y, w, h]) + block_id embedding
+  - Masked Self-Attention：只看已放置的 block，不看未來
+  - Cross-Attention：參考 Encoder 輸出（所有 block 的 contextual embedding）
+  - 輸出：下一個 block 的 (x, y, w, h)
+
+  - 層數：6 層 Transformer Decoder layer
+  - d_model：256（同 Encoder）
+  - num_heads：8
+
+Regression Head：
+  Decoder output (256維) → Linear(256, 64) → ReLU → Linear(64, 4) → (x, y, w, h)
+
+
+--------------------------------------------------------------------------------
+四、Loss Function
+--------------------------------------------------------------------------------
+
+訓練時使用 Teacher Forcing（Decoder 輸入為 ground truth 已放置序列，
+而非模型自己的預測，收斂更快）。
+
+【重要】不使用官方的 compute_training_loss_differentiable，
+完全採用以下自定義的四項 loss，避免重複計入。
+
+注意：fp_sol 的原始格式為 [w, h, x, y]，訓練時需轉換為 [x, y, w, h]。
+L_wirelength 與 L_area 計算時，需將正規化座標反正規化回原始尺度，
+才能與 HPWLbaseline 和 Areabbox_baseline 的單位一致。
+
+Total Loss = L_coord
+           + lambda_1 * L_wirelength
+           + lambda_2 * L_area
+           + lambda_3 * L_violation
+
+建議初始權重：lambda_1 = 0.3, lambda_2 = 0.3, lambda_3 = 0.4
+
+
+【4.1 L_coord（座標回歸 loss）】
+
+  對每個 block i，計算預測與 label 之間的 L2 loss：
+  L_coord = mean over all blocks of [ (x̂-x)² + (ŷ-y)² + (ŵ-w)² + (ĥ-h)² ]
+
+  注意：Preplaced block 的 loss 權重可設高一點（例如 x5），
+       強迫模型精確還原固定位置。
+
+
+【4.2 L_wirelength（HPWL gap）】
+
+  使用 FloorSet 提供的 HPWLbaseline（來自 metrics_sol 欄位）：
+  L_wirelength = (HPWL_pred - HPWL_baseline) / HPWL_baseline
+
+  HPWL_baseline 取法：
+    HPWL_baseline = metrics[6] + metrics[7]
+    （metrics[6] = b2b_weighted_wl，metrics[7] = p2b_weighted_wl）
+
+  HPWL_pred 包含兩部分：
+  - Inter-module HPWL：連接兩個 block 的 net，取 bounding box 半周長，以 W_int 加權
+  - External HPWL：block 中心到 terminal 的 Manhattan distance，以 W_ext 加權
+
+
+【4.3 L_area（Bounding box area gap）】
+
+  L_area = (Areabbox_pred - Areabbox_baseline) / Areabbox_baseline
+
+  Areabbox_pred = (x_max - x_min) * (y_max - y_min)（以預測座標計算）
+
+  Areabbox_baseline 取法：
+    不在 metrics_sol 中，需從 fp_sol ground truth positions 自行計算：
+    Areabbox_baseline = (x_max - x_min) * (y_max - y_min)，其中 x, y 來自 fp_sol[:, 2:4]
+
+
+【4.4 L_violation（Soft constraint 違反懲罰）】
+
+  原始資料只有 binary flag，沒有 group ID，group 的定義如下：
+    - 所有 is_mib == 1 的 block     → 視為同一組 MIB
+    - 所有 is_cluster == 1 的 block → 視為同一組 grouping
+
+  L_violation = V_grouping + V_mib + V_boundary + V_fixed + V_preplaced
+
+  各項計算：
+  - V_grouping：所有 is_cluster==1 的 block，各自 centroid 與組內平均 centroid 的距離加總
+  - V_mib     ：所有 is_mib==1 的 block，各自 (w, h) 與組內平均 (w, h) 的差值 L2
+  - V_boundary：block 邊緣到 bounding box 邊界的距離（需碰邊但未碰邊時懲罰）
+  - V_fixed   ：預測 (w, h) 與指定值的 L2（is_fixed_shape==1 的 block）
+  - V_preplaced：預測 (x, y, w, h) 與指定值的 L2（is_preplaced==1 的 block）
+
+
+--------------------------------------------------------------------------------
+五、資料處理
+--------------------------------------------------------------------------------
+
+【5.1 FloorSet-Lite 資料集】
+
+  - 訓練集：1,000,000 筆，block 數量 21~120
+  - 驗證集：100 筆（每個 size 各 1 筆）
+  - 測試集：100 筆（隱藏，最終評分用）
+  - 每筆資料包含：block 屬性、W_int、W_ext、terminal 位置、optimal solution
+
+  下載方式（使用官方 DataLoader）：
+    from iccad2026_evaluate import get_training_dataloader, get_validation_dataloader
+
+
+【5.2 Canvas 尺寸定義】
+
+  題目並未固定 canvas 大小，以所有 block 面積總和的平方根作為參考基準：
+
+    total_area = sum of all block area_targets
+    canvas_ref = sqrt(total_area) * k
+
+    canvas_W = canvas_ref
+    canvas_H = canvas_ref
+
+  係數 k 建議設為 1.2 ~ 1.3，原因：
+    - 實際 floorplan 的 utilization rate 通常在 60~80%，需預留走線與對齊空間
+    - k = 1.0 假設完美填滿，過於理想
+    - k = 1.2 ~ 1.3 預留 20~30% 空間，較符合實際情況
+
+  此定義的優點：
+    - 直接反映 blocks 實際需要的擺放空間，與 terminal 位置無關
+    - 不管 block 數量是 21 還是 120，canvas_ref 都自然地跟著縮放
+    - 每筆資料自己決定自己的縮放基準，數值範圍穩定
+
+
+【5.3 資料預處理】
+
+  1. 座標正規化：所有 (x, y, w, h) 除以 canvas_W / canvas_H，縮放到 [0, 1] 附近
+  2. 面積正規化：area_target 除以 (canvas_W * canvas_H)
+  3. W_int / W_ext 正規化：除以最大連線權重
+  4. 放置順序排序：依照 preplaced → fixed-shape → soft block 順序排列
+
+
+--------------------------------------------------------------------------------
+六、訓練設定
+--------------------------------------------------------------------------------
+
+  Optimizer   : AdamW
+  LR          : 1e-4，搭配 warmup（前 4000 步）+ cosine decay
+  Batch size  : 64
+  Epochs      : 100（或 early stopping，patience = 10）
+  Gradient clip: max_norm = 1.0
+
+  硬體建議：至少 1 張 GPU（A100 或等級相近）
+  訓練時間估計：視硬體而定，大約 1~3 天
+
+
+【6.1 每 epoch 結束：Loss 趨勢圖】
+
+  每個 epoch 結束後，計算當次 epoch 的平均 Training Loss，
+  並更新（覆蓋）同一張圖表檔案：
+
+    路徑：logs/loss_curve.png
+    縱軸：Training Loss
+    橫軸：Epoch
+
+
+
+
+【6.2 每 5 個 epoch：官方 Validation 評估】
+
+  每 5 個 epoch 執行一次官方 evaluator，計算驗證集分數：
+
+    if epoch % 5 == 0:
+        執行以下指令，並同時輸出到 terminal 與 log 檔
+
+  執行指令：
+    python iccad2026contest/iccad2026_evaluate.py \
+        --evaluate iccad2026contest/my_optimizer.py
+
+  輸出目標：
+    1. Terminal：直接印出官方 evaluator 的輸出結果
+    2. Log 檔：追加寫入 logs/validation_log.txt
+
+  Log 檔格式範例（logs/validation_log.txt）：
+    ========== Epoch 5 ==========
+    <官方 evaluator 輸出內容>
+
+    ========== Epoch 10 ==========
+    <官方 evaluator 輸出內容>
+    ...
+
+  注意：執行前請確認 logs/ 目錄已存在：
+    import os
+    os.makedirs("logs", exist_ok=True)
+
+
+【6.3 每 5 個 epoch：Floorplan 視覺化】
+
+  與官方 Validation 評估同步執行，從驗證集中選取 10 筆 case 各繪製一張比較圖，
+  並存到 logs/viz/ 目錄下：
+
+  Case 選取方式：
+    驗證集涵蓋 block size 21~120，每 10 個 size 取一筆，共 10 筆：
+      size 21, 31, 41, 51, 61, 71, 81, 91, 101, 111
+    目的是觀察模型在不同複雜度下的表現差異。
+
+  存檔路徑：
+    logs/viz/epoch_{N}_case_{size}.png
+
+  每張圖的版面配置：
+    左半邊：呼叫 visualize_lite() 畫 Ground Truth floorplan
+    右半邊：呼叫 visualize_lite() 畫 my_optimizer 的預測 floorplan
+    整張圖標題顯示：Case {size} blocks | Epoch {N}
+
+  顏色與圖例沿用官方 visualize_lite() 的定義：
+    - silver      → no constraint
+    - olive       → boundary
+    - violet      → fixed-shape
+    - gray        → preplaced
+    - red         → cluster (grouping)
+    - darkgreen   → MIB
+    - 綠色圓點    → terminal (pin) 位置
+    - 紅線        → block 與 block 之間的連線（B2B connectivity）
+    - 藍線        → pin 與 block 之間的連線（P2B connectivity）
+
+
+--------------------------------------------------------------------------------
+七、評估指標
+--------------------------------------------------------------------------------
+
+依照 FloorSet 官方 Cost function（越低越好）：
+
+  Cost = (1 + alpha * (HPWL_gap + Area_gap))
+         * exp(beta * Violations_relative)
+         * max(0.7, RuntimeFactor^gamma)
+
+  alpha = 0.5, beta = 2.0, gamma = 0.3
+
+  其中：
+  - HPWL_gap           = (HPWL_pred - HPWL_baseline) / HPWL_baseline
+  - Area_gap           = (Area_pred - Area_baseline) / Area_baseline
+  - Violations_relative ∈ [0, 1]，參考 FloorSet 公式（Equation 3）
+
+  Infeasible solution（有 overlap 或 area tolerance 違反）直接得 cost = 10。
+
+  Total Score = 所有 100 個 test case 的加權平均，
+               以 block 數量為指數權重（block 越多、權重越大）。
+
+  使用官方 evaluator 驗證：
+    from iccad2026_evaluate import evaluate_solution
+
+
+--------------------------------------------------------------------------------
+八、實作順序建議
+--------------------------------------------------------------------------------
+
+Phase 1：基礎建設
+  [ ] 安裝 FloorSet 環境，確認 DataLoader 可正常讀取資料
+  [ ] 實作 Token Feature 提取（raw feature → Linear → d_model）
+  [ ] 實作 Netlist Attention Bias（W_int 加入 attention score）
+  [ ] 實作基本 Encoder-Decoder Transformer（可先用 PyTorch 內建 nn.Transformer）
+
+Phase 2：訓練流程
+  [ ] 實作 Teacher Forcing 訓練迴圈
+  [ ] 實作 L_coord loss
+  [ ] 確認模型可以 overfit 一小批資料（sanity check）
+
+Phase 3：完整 Loss
+  [ ] 加入 L_wirelength（HPWL 計算）
+  [ ] 加入 L_area（bounding box 計算）
+  [ ] 加入 L_violation（各 soft constraint 懲罰）
+  [ ] 調整 lambda 權重
+
+Phase 4：推論與評估
+  [ ] 實作自回歸推論（不使用 Teacher Forcing）
+  [ ] 接入 FloorSet 官方 evaluator
+  [ ] 在驗證集上計算 Cost，對比 baseline
+
+Phase 5：優化
+  [ ] 調整 d_model、層數、num_heads
+  [ ] 嘗試 post-processing：對輕微 overlap 做局部修正
+  [ ] 分析哪類 constraint 違反最多，針對性調整 lambda
+
+
+--------------------------------------------------------------------------------
+九、檔案結構建議
+--------------------------------------------------------------------------------
+
+  project/
+  ├── data/
+  │   └── floorset_loader.py        # FloorSet DataLoader wrapper
+  ├── model/
+  │   ├── token_feature.py          # Token feature 提取與投影
+  │   ├── encoder.py                # Transformer Encoder + Netlist Attention Bias
+  │   ├── decoder.py                # Transformer Decoder（自回歸）
+  │   ├── regression_head.py        # (x, y, w, h) 輸出 head
+  │   └── transformer_floorplan.py  # 整合模型
+  ├── loss/
+  │   ├── coord_loss.py             # L_coord
+  │   ├── wirelength_loss.py        # L_wirelength（HPWL）
+  │   ├── area_loss.py              # L_area
+  │   └── violation_loss.py         # L_violation
+  ├── train.py                      # 訓練主程式
+  ├── evaluate.py                   # 推論 + 官方 evaluator 接入
+  └── config.py                     # 超參數設定
+
+
+--------------------------------------------------------------------------------
+十、參考資料
+--------------------------------------------------------------------------------
+
+  - FloorSet 論文：Mallappa et al., ICCAD 2025
+  - FloorSet GitHub：https://github.com/IntelLabs/FloorSet/tree/main/iccad2026contest
+  - FloorSet Dataset：Hugging Face（使用官方 DataLoader 自動下載）
+  - Attention is All You Need：Vaswani et al., 2017
+  - DETR（非自回歸 Transformer 偵測參考）：Carion et al., 2020
+
+================================================================================
+  END OF PLAN
+================================================================================

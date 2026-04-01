@@ -43,3 +43,6 @@ contest_venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# training dataset
+floorset_lite/

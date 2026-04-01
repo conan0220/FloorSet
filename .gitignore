@@ -50,3 +50,4 @@ floorset_lite/
 # solution
 cache/
 logs/
+checkpoints/

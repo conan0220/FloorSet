@@ -15,6 +15,7 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import torch
@@ -507,7 +508,9 @@ def train(smoke_test: bool = False):
         running_loss = 0.0
         n_steps = 0
 
-        for batch_idx, raw_batch in enumerate(train_loader):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch",
+                    dynamic_ncols=True, disable=smoke_test)
+        for batch_idx, raw_batch in enumerate(pbar):
             if n_batches_cap is not None and batch_idx >= n_batches_cap:
                 break
 
@@ -541,6 +544,11 @@ def train(smoke_test: bool = False):
             running_loss += loss_parts["total"]
             n_steps += 1
             global_step += 1
+
+            pbar.set_postfix(
+                loss=f"{loss_parts['total']:.4f}",
+                samples=f"{(batch_idx + 1) * batch_size_eff}",
+            )
 
             if smoke_test:
                 lr_now = scheduler.get_last_lr()[0]

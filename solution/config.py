@@ -81,6 +81,7 @@ GRAD_CLIP_NORM = 1.0
 LAMBDA_WIRELENGTH = 0.3     # weight for L_wirelength
 LAMBDA_AREA       = 0.3     # weight for L_area
 LAMBDA_VIOLATION  = 0.4     # weight for L_violation
+LAMBDA_OVERLAP    = 0.5     # weight for L_overlap
 
 # Extra weight on preplaced blocks in L_coord
 PREPLACED_COORD_WEIGHT = 5.0

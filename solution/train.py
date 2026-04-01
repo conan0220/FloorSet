@@ -30,7 +30,7 @@ sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
 
 from config import (
     BATCH_SIZE, MAX_EPOCHS, PATIENCE, LEARNING_RATE, WARMUP_STEPS,
-    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION,
+    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION, LAMBDA_OVERLAP,
     VALIDATE_EVERY, VIZ_BLOCK_SIZES, RAW_FEATURE_DIM,
     LOGS_DIR, VIZ_DIR, CHECKPOINT_DIR, CONTEST_DIR,
     CACHE_DIR, CACHE_PRELOAD,
@@ -50,6 +50,7 @@ from loss.coord_loss     import coord_loss
 from loss.wirelength_loss import wirelength_loss
 from loss.area_loss      import area_loss
 from loss.violation_loss import violation_loss
+from loss.overlap_loss   import overlap_loss
 
 
 # =============================================================================
@@ -202,15 +203,17 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
     # De-normalise for HPWL / area losses (raw pixel scale)
     pred_raw = pred_norm * crefs.view(-1, 1, 1)  # [B, k, 4]
 
-    l_coord = coord_loss(pred_norm, gtn, cons)
-    l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
-    l_area  = area_loss(pred_raw, abase)
-    l_viol  = violation_loss(pred_norm, gtn, cons)
+    l_coord   = coord_loss(pred_norm, gtn, cons)
+    l_wl      = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
+    l_area    = area_loss(pred_raw, abase)
+    l_viol    = violation_loss(pred_norm, gtn, cons)
+    l_overlap = overlap_loss(pred_norm)
 
     total = (l_coord
              + LAMBDA_WIRELENGTH * l_wl
-             + LAMBDA_AREA * l_area
-             + LAMBDA_VIOLATION * l_viol)
+             + LAMBDA_AREA       * l_area
+             + LAMBDA_VIOLATION  * l_viol
+             + LAMBDA_OVERLAP    * l_overlap)
 
     return total, {
         "total":      total.item(),
@@ -218,6 +221,7 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
         "wirelength": l_wl.item(),
         "area":       l_area.item(),
         "violation":  l_viol.item(),
+        "overlap":    l_overlap.item(),
     }, pred_norm
 
 
@@ -342,6 +346,71 @@ def _polygons_to_fp_sol(polygons, block_count: int) -> torch.Tensor:
     return fp
 
 
+def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
+    """
+    Compute all loss terms for one sample (batch size = 1).
+    pred_norm: [1, k, 4] on device.
+    Returns dict of scalar .item() values.
+    """
+    k   = s["block_count"]
+    ref = s["canvas_ref"]
+
+    gtn  = s["gt_positions_norm"][:k].unsqueeze(0).to(device)   # [1, k, 4]
+    cons = s["constraints_sorted"][:k].unsqueeze(0).to(device)  # [1, k, 5]
+    p2b  = s["p2b_conn"].unsqueeze(0).to(device)                 # [1, e, 3]
+    pins = s["pins_pos"].unsqueeze(0).to(device)                  # [1, r, 2]
+
+    hbase = torch.tensor([s["hpwl_baseline"]], device=device)
+    abase = torch.tensor([s["area_baseline"]], device=device)
+
+    # w_int_unnorm: use cached value if present, else compute on the fly
+    if "w_int_unnorm" in s:
+        wiu = s["w_int_unnorm"][:k, :k].unsqueeze(0).to(device)
+    else:
+        wiu = build_w_int_unnorm(
+            s["b2b_conn"], k, s["sort_idx"]
+        ).unsqueeze(0).to(device)
+
+    pred_raw = pred_norm * ref   # [1, k, 4]
+
+    with torch.no_grad():
+        l_coord   = coord_loss(pred_norm, gtn, cons).item()
+        l_wl      = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
+        l_area    = area_loss(pred_raw, abase).item()
+        l_viol    = violation_loss(pred_norm, gtn, cons).item()
+        l_overlap = overlap_loss(pred_norm).item()
+        total     = (l_coord
+                     + LAMBDA_WIRELENGTH * l_wl
+                     + LAMBDA_AREA       * l_area
+                     + LAMBDA_VIOLATION  * l_viol
+                     + LAMBDA_OVERLAP    * l_overlap)
+
+    return {
+        "total":      total,
+        "coord":      l_coord,
+        "wirelength": l_wl,
+        "area":       l_area,
+        "violation":  l_viol,
+        "overlap":    l_overlap,
+    }
+
+
+def _infer_and_save(model, s: dict, epoch: int, device, source: str, label: str):
+    """Run AR inference on one preprocessed sample dict, compute loss, save figure."""
+    k   = s["block_count"]
+    tf_ = s["token_features"][:k].unsqueeze(0).to(device)   # [1, k, 18]
+    wi_ = s["w_int"][:k, :k].unsqueeze(0).to(device)         # [1, k, k]
+
+    pred_norm = model(tf_, wi_, teacher_forcing=False)        # [1, k, 4]
+    pred_raw  = (pred_norm[0] * s["canvas_ref"]).cpu()        # [k, 4]
+    gt_raw    = s["gt_positions_raw"][:k]                     # [k, 4] sorted
+
+    loss_parts = _compute_viz_loss(s, pred_norm, device)
+
+    _save_viz(gt_raw, pred_raw, epoch, k, source=source,
+              label=label, loss_parts=loss_parts)
+
+
 def visualize_predictions(
     model:    nn.Module,
     epoch:    int,
@@ -349,57 +418,71 @@ def visualize_predictions(
     dry_run:  bool = False,
 ):
     """
-    For each block size in VIZ_BLOCK_SIZES, run AR inference on the
-    corresponding validation case and save a GT-vs-predicted figure.
+    Saves GT-vs-Predicted figures for:
+      - 10 validation cases  (one per block size in VIZ_BLOCK_SIZES)
+      - 10 training cases    (evenly spaced from the first shard of the cache)
     """
     if dry_run:
-        for sz in VIZ_BLOCK_SIZES:
-            print(f"  [smoke-test] viz epoch={epoch} case size={sz} — skipped (dry run)")
+        print(f"  [smoke-test] viz epoch={epoch} — skipped (dry run)")
         return
-
-    try:
-        from lite_dataset_test import FloorplanDatasetLiteTest
-    except ImportError:
-        print("[viz] FloorplanDatasetLiteTest not importable — skipping.")
-        return
-
-    dataset = FloorplanDatasetLiteTest(str(_REPO_ROOT) + "/")
 
     model.eval()
     with torch.no_grad():
-        for sz in VIZ_BLOCK_SIZES:
-            test_id = sz - 21      # index 0 = 21 blocks, index 10 = 31 blocks, ...
-            if test_id >= len(dataset):
-                continue
 
-            sample = dataset[test_id]
-            inputs, labels = sample["input"], sample["label"]
-            area_target, b2b_conn, p2b_conn, pins_pos, constraints = inputs
-            polygons, val_metrics = labels
+        # ── Validation cases ──────────────────────────────────────────────
+        try:
+            from lite_dataset_test import FloorplanDatasetLiteTest
+            dataset = FloorplanDatasetLiteTest(str(_REPO_ROOT) + "/")
+        except ImportError:
+            print("[viz] FloorplanDatasetLiteTest not importable — skipping val viz.")
+            dataset = None
 
-            block_count = int((area_target != -1).sum().item())
-            fp_sol = _polygons_to_fp_sol(polygons, block_count)
-            # pad to full length for preprocess_sample
-            fp_full = torch.zeros(area_target.shape[0], 4)
-            fp_full[:block_count] = fp_sol
+        if dataset is not None:
+            for sz in VIZ_BLOCK_SIZES:
+                test_id = sz - 21
+                if test_id >= len(dataset):
+                    continue
+                sample = dataset[test_id]
+                inputs, labels = sample["input"], sample["label"]
+                area_target, b2b_conn, p2b_conn, pins_pos, constraints = inputs
+                polygons, val_metrics = labels
 
-            s = preprocess_sample(
-                area_target, b2b_conn, p2b_conn,
-                pins_pos, constraints, fp_full, val_metrics,
-            )
+                block_count = int((area_target != -1).sum().item())
+                fp_sol = _polygons_to_fp_sol(polygons, block_count)
+                fp_full = torch.zeros(area_target.shape[0], 4)
+                fp_full[:block_count] = fp_sol
 
-            tf_  = s["token_features"].unsqueeze(0).to(device)   # [1, k, 18]
-            wi_  = s["w_int"].unsqueeze(0).to(device)             # [1, k, k]
+                s = preprocess_sample(
+                    area_target, b2b_conn, p2b_conn,
+                    pins_pos, constraints, fp_full, val_metrics,
+                )
+                _infer_and_save(model, s, epoch, device,
+                                source="val", label=f"case_{sz}")
 
-            pred_norm = model(tf_, wi_, teacher_forcing=False)    # [1, k, 4]
-            pred_raw  = (pred_norm[0] * s["canvas_ref"]).cpu()    # [k, 4]
-            gt_raw    = s["gt_positions_raw"]                      # [k, 4] sorted
+        # ── Training cases (from cache first shard) ───────────────────────
+        shard_path = CACHE_DIR / "shard_000000.pt"
+        if not shard_path.exists():
+            print("[viz] No cache shard found — skipping train viz.")
+            return
 
-            _save_viz(gt_raw, pred_raw, sz, epoch, block_count)
+        shard: list = torch.load(shard_path, weights_only=False)
+        n_train = min(10, len(shard))
+        step = max(1, len(shard) // n_train)
+        train_samples = [shard[i * step] for i in range(n_train)]
+
+        for idx, s in enumerate(train_samples):
+            _infer_and_save(model, s, epoch, device,
+                            source="train", label=f"sample_{idx:04d}")
 
 
-def _save_viz(gt_raw, pred_raw, block_size: int, epoch: int, block_count: int):
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+def _save_viz(gt_raw, pred_raw, epoch: int, block_count: int,
+              source: str, label: str, loss_parts: dict):
+    """
+    source     : "val" or "train"
+    label      : used in filename and title (e.g. "case_21" or "sample_0042")
+    loss_parts : dict with keys total/coord/wirelength/area/violation/overlap
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
     colors = plt.cm.tab20(range(block_count))
 
     for ax, positions, title in [
@@ -419,9 +502,22 @@ def _save_viz(gt_raw, pred_raw, block_size: int, epoch: int, block_count: int):
         ax.set_aspect("equal")
         ax.set_xlabel("X"); ax.set_ylabel("Y")
 
-    fig.suptitle(f"Epoch {epoch} — {block_size} blocks")
-    fig.tight_layout()
-    out = VIZ_DIR / f"epoch_{epoch:03d}_case_{block_size}.png"
+    fig.suptitle(f"Epoch {epoch} [{source}] {label}  ({block_count} blocks)")
+
+    loss_text = (
+        f"total={loss_parts['total']:.4f}  "
+        f"coord={loss_parts['coord']:.4f}  "
+        f"wl={loss_parts['wirelength']:.4f}  "
+        f"area={loss_parts['area']:.4f}  "
+        f"viol={loss_parts['violation']:.4f}  "
+        f"overlap={loss_parts['overlap']:.4f}"
+    )
+    fig.text(0.5, 0.01, loss_text, ha="center", va="bottom",
+             fontsize=8, family="monospace",
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
+
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
+    out = VIZ_DIR / f"epoch_{epoch:03d}_{source}_{label}.png"
     fig.savefig(out, dpi=120)
     plt.close(fig)
     print(f"  [viz] saved {out.name}")
@@ -527,6 +623,7 @@ def train(smoke_test: bool = False):
                 print(f"    wirelength = {loss_parts['wirelength']}")
                 print(f"    area       = {loss_parts['area']}")
                 print(f"    violation  = {loss_parts['violation']}")
+                print(f"    overlap    = {loss_parts['overlap']}")
                 print(f"    total      = {loss_parts['total']}")
                 print(f"    pred min/max/mean = {p.min().item():.4e} / {p.max().item():.4e} / {p.mean().item():.4e}"
                       f"  nan={torch.isnan(p).any().item()} inf={torch.isinf(p).any().item()}")
@@ -554,6 +651,7 @@ def train(smoke_test: bool = False):
                       f"  wl={loss_parts['wirelength']:.4f}"
                       f"  area={loss_parts['area']:.4f}"
                       f"  viol={loss_parts['violation']:.4f}"
+                      f"  overlap={loss_parts['overlap']:.4f}"
                       f"  lr={lr_now:.2e}")
 
         # ── Epoch-end logging ─────────────────────────────────────────────

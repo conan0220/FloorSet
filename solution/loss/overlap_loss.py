@@ -50,7 +50,7 @@ def overlap_loss(
     mask = torch.triu(torch.ones(k, k, device=overlap_area.device), diagonal=1)
     overlap_area = overlap_area * mask.unsqueeze(0)   # [B, k, k]
 
-    return overlap_area.sum(dim=(1, 2)).mean()
+    return overlap_area.sum()
 
 
 # =============================================================================
@@ -80,9 +80,9 @@ if __name__ == "__main__":
     full_overlap[:, :, 3] = 0.4
     full_overlap_req = full_overlap.detach().requires_grad_(True)
     loss_full = overlap_loss(full_overlap_req)
-    # k*(k-1)/2 pairs × 0.4*0.4 = 6 × 0.16 = 0.96
-    print(f"Full-overlap loss  : {loss_full.item():.6f}  (expected {k*(k-1)//2 * 0.16:.4f})")
-    assert abs(loss_full.item() - k * (k - 1) / 2 * 0.16) < 1e-4
+    # B * k*(k-1)/2 pairs × 0.4*0.4 = 2 * 6 × 0.16 = 1.92
+    print(f"Full-overlap loss  : {loss_full.item():.6f}  (expected {B * k*(k-1)//2 * 0.16:.4f})")
+    assert abs(loss_full.item() - B * k * (k - 1) / 2 * 0.16) < 1e-4
 
     loss_full.backward()
     assert full_overlap_req.grad is not None

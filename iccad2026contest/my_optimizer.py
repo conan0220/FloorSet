@@ -40,6 +40,10 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import torch
 
 # ── Path bootstrap ─────────────────────────────────────────────────────────────
@@ -463,10 +467,10 @@ if __name__ == "__main__":
     assert len(positions) == block_count, \
         f"Length mismatch: got {len(positions)}, expected {block_count}"
 
-    print("\nFirst 5 positions (x, y, w, h):")
-    for i, pos in enumerate(positions[:5]):
+    print(f"\nAll {block_count} positions (x, y, w, h):")
+    for i, pos in enumerate(positions):
         x, y, w, h = pos
-        print(f"  block {i:2d}: x={x:.3f}  y={y:.3f}  w={w:.3f}  h={h:.3f}")
+        print(f"  block {i:2d}: x={x:.3f}  y={y:.3f}  w={w:.3f}  h={h:.3f}  area={w*h:.3f}")
         assert all(math.isfinite(v) for v in pos), f"Non-finite value in block {i}: {pos}"
 
     # Check non-all-zero: at least some block should have non-trivial placement
@@ -475,3 +479,122 @@ if __name__ == "__main__":
 
     print("\nAll checks passed.")
     print("=" * 60)
+
+    # ── Compute losses for predicted positions ────────────────────────────
+    from data.floorset_loader import preprocess_sample, build_w_int_unnorm
+    from loss.coord_loss      import coord_loss
+    from loss.wirelength_loss import wirelength_loss
+    from loss.area_loss       import area_loss
+    from loss.violation_loss  import violation_loss
+    from loss.overlap_loss    import overlap_loss
+    from loss.block_area_loss import block_area_loss
+    from loss.nonneg_loss     import nonneg_loss
+    from config import (
+        LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION,
+        LAMBDA_OVERLAP, LAMBDA_BLOCK_AREA, LAMBDA_NONNEG,
+    )
+
+    n_padded = area_target.shape[0]
+    fp_sol   = torch.zeros(n_padded, 4)
+    metrics  = torch.zeros(8)
+    s = preprocess_sample(
+        area_target, b2b_conn, p2b_conn,
+        pins_pos, constraints, fp_sol, metrics,
+    )
+    device = optimizer._device
+    k      = s["block_count"]
+    ref    = s["canvas_ref"]
+
+    pred_t = torch.tensor(positions, dtype=torch.float32)          # [k, 4]
+    pred_norm = (pred_t / ref).unsqueeze(0).to(device)              # [1, k, 4]
+    pred_raw  = pred_t.unsqueeze(0).to(device)                      # [1, k, 4]
+
+    tf_feat = s["token_features"][:k].unsqueeze(0).to(device)
+    gtn     = s["gt_positions_norm"][:k].unsqueeze(0).to(device)
+    cons    = s["constraints_sorted"][:k].unsqueeze(0).to(device)
+    p2b_t   = s["p2b_conn"].unsqueeze(0).to(device)
+    pins_t  = s["pins_pos"].unsqueeze(0).to(device)
+    hbase   = torch.tensor([s["hpwl_baseline"]], device=device)
+    abase   = torch.tensor([s["area_baseline"]], device=device)
+    wiu     = build_w_int_unnorm(b2b_conn, k, s["sort_idx"]).unsqueeze(0).to(device)
+    kpm     = torch.zeros(1, k, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        l_coord      = coord_loss(pred_norm, gtn, cons).item()
+        l_wl         = wirelength_loss(pred_raw, wiu, pins_t, p2b_t, hbase).item()
+        l_area       = area_loss(pred_raw, abase).item()
+        l_viol       = violation_loss(pred_norm, gtn, cons).item()
+        l_overlap    = overlap_loss(pred_norm).item()
+        l_block_area = block_area_loss(pred_norm, tf_feat, kpm).item()
+        l_nonneg     = nonneg_loss(pred_norm, kpm).item()
+        l_total      = (l_coord
+                        + LAMBDA_WIRELENGTH  * l_wl
+                        + LAMBDA_AREA        * l_area
+                        + LAMBDA_VIOLATION   * l_viol
+                        + LAMBDA_OVERLAP     * l_overlap
+                        + LAMBDA_BLOCK_AREA  * l_block_area
+                        + LAMBDA_NONNEG      * l_nonneg)
+
+    # ── Visualize GT vs Predicted ─────────────────────────────────────────
+    # Parse GT positions from polygons
+    gt_positions = []
+    for i in range(block_count):
+        verts = polygons[i]
+        if isinstance(verts, torch.Tensor):
+            valid = verts[verts[:, 0] != -1]
+        else:
+            valid = torch.tensor(verts)
+            valid = valid[valid[:, 0] != -1]
+        if valid.numel() > 0:
+            xy_min = valid.min(0).values
+            xy_max = valid.max(0).values
+            gt_positions.append((
+                xy_min[0].item(), xy_min[1].item(),
+                (xy_max[0] - xy_min[0]).item(),
+                (xy_max[1] - xy_min[1]).item(),
+            ))
+        else:
+            gt_positions.append((0.0, 0.0, 0.0, 0.0))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    colors = plt.cm.tab20(range(block_count))
+
+    for ax, pos_list, title in [
+        (axes[0], gt_positions, f"GT  ({block_count} blocks)"),
+        (axes[1], positions,   f"Pred ({block_count} blocks)"),
+    ]:
+        ax.set_title(title)
+        for i, (x, y, w, h) in enumerate(pos_list):
+            rect = mpatches.Rectangle(
+                (x, y), w, h,
+                linewidth=0.8, edgecolor="black",
+                facecolor=colors[i % len(colors)], alpha=0.7,
+            )
+            ax.add_patch(rect)
+        ax.autoscale()
+        ax.set_aspect("equal")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+
+    fig.suptitle("Smoke test — validation case 0")
+
+    loss_text = (
+        f"total={l_total:.4f}  "
+        f"coord={l_coord:.4f}  "
+        f"wl={l_wl:.4f}  "
+        f"area={l_area:.4f}  "
+        f"viol={l_viol:.4f}  "
+        f"overlap={l_overlap:.4f}  "
+        f"block_area={l_block_area:.4f}  "
+        f"nonneg={l_nonneg:.4f}"
+    )
+    fig.text(0.5, 0.01, loss_text, ha="center", va="bottom",
+             fontsize=8, family="monospace",
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
+
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
+
+    out = _CONTEST_DIR / "smoke_test_viz.png"
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+    print(f"\n[viz] saved {out}")

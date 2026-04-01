@@ -33,8 +33,7 @@ def block_area_loss(
 
     error = (pred_area - area_target_norm) ** 2  # [B, k]
 
-    n_valid = valid.sum().clamp(min=1)
-    return (error * valid).sum() / n_valid
+    return (error * valid).sum()
 
 
 # =============================================================================

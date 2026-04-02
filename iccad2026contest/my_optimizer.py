@@ -531,8 +531,15 @@ if __name__ == "__main__":
     abase  = torch.tensor([s["area_baseline"]], device=device)
     wiu    = build_w_int_unnorm(b2b_conn, k, s["sort_idx"]).unsqueeze(0).to(device)
 
+    # Run TF forward to obtain logits for coord_loss
+    tf_t_  = s["token_features"][:k].unsqueeze(0).to(device)   # [1, k, 18]
+    wi_t_  = s["w_int"][:k, :k].unsqueeze(0).to(device)         # [1, k, k]
+    kpm_   = torch.zeros(1, k, dtype=torch.bool, device=device) # no padding
+
     with torch.no_grad():
-        l_coord = coord_loss(pred_norm, gtn, cons).item()
+        _, logits_tf = optimizer._model(tf_t_, wi_t_, gt_positions=gtn,
+                                        teacher_forcing=True)    # [1, k, G*G]
+        l_coord = coord_loss(logits_tf, gtn, cons, kpm_).item()
         l_wl    = wirelength_loss(pred_raw, wiu, pins_t, p2b_t, hbase).item()
         l_area  = area_loss(pred_raw, abase).item()
         l_viol  = violation_loss(pred_norm, cons).item()

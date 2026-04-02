@@ -187,13 +187,13 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
     hbase = batch["hpwl_baselines"].to(device) # [B]
     abase = batch["area_baselines"].to(device) # [B]
 
-    # Forward (teacher forcing)
-    pred_norm = model(
+    # Forward (teacher forcing) → (pred_norm [B,k,4], logits [B,k,G*G])
+    pred_norm, logits = model(
         tf, wi,
         gt_positions=gtn,
         key_padding_mask=kpm,
         teacher_forcing=True,
-    )                                          # [B, k, 4]
+    )
 
     # Zero out padded positions so they don't contribute to losses
     valid = (~kpm).float().unsqueeze(-1)       # [B, k, 1]
@@ -202,7 +202,7 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
     # De-normalise for HPWL / area losses (raw pixel scale)
     pred_raw = pred_norm * crefs.view(-1, 1, 1)  # [B, k, 4]
 
-    l_coord = coord_loss(pred_norm, gtn, cons)
+    l_coord = coord_loss(logits, gtn, cons, kpm)
     l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
     l_area  = area_loss(pred_raw, abase)
     l_viol  = violation_loss(pred_norm, cons)
@@ -370,7 +370,7 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
     pred_raw = pred_norm * ref   # [1, k, 4]
 
     with torch.no_grad():
-        l_coord = coord_loss(pred_norm, gtn, cons).item()
+        l_coord = 0.0   # AR mode has no logits; coord_loss requires logits
         l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
         l_area  = area_loss(pred_raw, abase).item()
         l_viol  = violation_loss(pred_norm, cons).item()

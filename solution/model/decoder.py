@@ -130,12 +130,14 @@ class FloorplanDecoder(nn.Module):
         encoder_output:  torch.Tensor,          # [B, k, d_model]
         gt_positions:    torch.Tensor = None,   # [B, k, 4]  — teacher forcing only
         teacher_forcing: bool         = True,
-        regression_head: nn.Module    = None,   # [B,1,d_model] → [B,1,4] — inference only
+        regression_head: nn.Module    = None,   # inference only
         token_features:  torch.Tensor = None,   # [B, k, 18]  — inference only
+        occupancy:       torch.Tensor = None,   # [B, G, G]   — inference only
     ) -> torch.Tensor:
         """
         Returns:
-            [B, k, d_model]  decoder hidden states (input to regression head)
+            teacher_forcing=True  → [B, k, d_model]  decoder hidden states
+            teacher_forcing=False → [B, k, 4]         predicted positions
         """
         B, k, _ = encoder_output.shape
         device   = encoder_output.device
@@ -159,7 +161,7 @@ class FloorplanDecoder(nn.Module):
 
             sos        = self.sos_token.expand(B, 1, -1)            # [B, 1, d_model]
             tgt_tokens = [sos]
-            dec_outputs = []
+            positions  = []                                          # collect [B,1,4]
 
             for t in range(k):
                 tgt         = torch.cat(tgt_tokens, dim=1)          # [B, t+1, d_model]
@@ -170,19 +172,20 @@ class FloorplanDecoder(nn.Module):
                     tgt_mask=causal_mask,
                 )                                                    # [B, t+1, d_model]
                 last = dec_out[:, -1:, :]                            # [B, 1, d_model]
-                dec_outputs.append(last)
+
+                tf_t     = token_features[:, t:t+1, :]              # [B, 1, 18]
+                pred_pos = regression_head(last, tf_t, occupancy)   # [B, 1, 4]
+                positions.append(pred_pos)
 
                 if t < k - 1:
-                    tf_t     = token_features[:, t:t+1, :]           # [B, 1, 18]
-                    pred_pos = regression_head(last, tf_t)           # [B, 1, 4]
-                    block_id   = torch.tensor([t], device=device)    # [1]
+                    block_id   = torch.tensor([t], device=device)
                     next_token = (
                         self.coord_proj(pred_pos)
                         + self.block_id_embed(block_id)
                     )                                                # [B, 1, d_model]
                     tgt_tokens.append(next_token)
 
-            return torch.cat(dec_outputs, dim=1)                    # [B, k, d_model]
+            return torch.cat(positions, dim=1)                      # [B, k, 4]
 
 
 # =============================================================================
@@ -220,8 +223,16 @@ if __name__ == "__main__":
     # ── Autoregressive inference ──────────────────────────────────
     print("\n[2] Autoregressive inference mode")
 
-    # Minimal dummy regression head: Linear(d_model, 4)
-    dummy_head = nn.Linear(D_MODEL, 4)
+    # Dummy head: signature (x [B,1,d_model], tf [B,1,18], occ) → [B,1,4]
+    class _DummyHead(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(D_MODEL, 4)
+        def forward(self, x, token_features, occupancy=None):
+            return self.proj(x)  # [B, 1, 4]
+
+    dummy_head    = _DummyHead()
+    token_features_dummy = torch.zeros(B, k, 18)
 
     decoder.eval()
     with torch.no_grad():
@@ -229,11 +240,12 @@ if __name__ == "__main__":
             enc_out,
             teacher_forcing=False,
             regression_head=dummy_head,
+            token_features=token_features_dummy,
         )
     print(f"  encoder_output shape : {tuple(enc_out.shape)}")
     print(f"  output         shape : {tuple(out_ar.shape)}")
-    assert out_ar.shape == (B, k, D_MODEL), \
-        f"Expected ({B}, {k}, {D_MODEL}), got {tuple(out_ar.shape)}"
+    assert out_ar.shape == (B, k, 4), \
+        f"Expected ({B}, {k}, 4), got {tuple(out_ar.shape)}"
 
     # ── Parameter summary ─────────────────────────────────────────
     total = sum(p.numel() for p in decoder.parameters())

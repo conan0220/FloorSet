@@ -1,49 +1,62 @@
 """
-L_coord — per-block coordinate regression loss.
+L_coord — grid-based coordinate cross-entropy loss.
 
-For each block i:
-    loss_i = (x̂-x)² + (ŷ-y)² + (ŵ-w)² + (ĥ-h)²
+Converts GT (x, y) positions to grid indices (cell = floor(pos * G)),
+then computes cross-entropy against the predicted logits over G×G cells.
 
-Preplaced blocks are up-weighted by `preplaced_weight` (default 5.0).
-Returns the weighted average across all blocks and all batch samples.
+Excluded from the loss:
+  - Preplaced blocks  (position is hard-constrained, no need to learn)
+  - Padding tokens    (key_padding_mask == True)
 """
 
 import sys
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import PREPLACED_COORD_WEIGHT
+from config import GRID_SIZE
 
 
 def coord_loss(
-    pred_positions:   torch.Tensor,                    # [B, k, 4]
-    gt_positions:     torch.Tensor,                    # [B, k, 4]
-    constraints:      torch.Tensor,                    # [B, k, 5]
-    preplaced_weight: float = PREPLACED_COORD_WEIGHT,  # default 5.0
+    logits:           torch.Tensor,   # [B, k, G*G]
+    gt_positions_norm: torch.Tensor,  # [B, k, 4]  (x, y, w, h), normalised
+    constraints:      torch.Tensor,   # [B, k, 5]
+    key_padding_mask: torch.Tensor,   # [B, k] bool  (True = padding)
 ) -> torch.Tensor:
     """
-    Weighted coordinate MSE loss.
-
     Args:
-        pred_positions   [B, k, 4]  predicted (x, y, w, h), normalised
-        gt_positions     [B, k, 4]  ground truth (x, y, w, h), normalised
-        constraints      [B, k, 5]  placement constraints; col 1 = is_preplaced
-        preplaced_weight float      extra weight for preplaced blocks
+        logits            [B, k, G*G]  raw logits from DiscreteRegressionHead
+        gt_positions_norm [B, k, 4]   ground-truth (x, y, w, h), in [0, 1]
+        constraints       [B, k, 5]   col 1 = is_preplaced
+        key_padding_mask  [B, k]      True where the token is padding
 
     Returns:
-        scalar loss (weighted mean over all blocks × batch)
+        scalar cross-entropy loss (mean over valid tokens)
     """
-    # Per-block squared error: [B, k]
-    per_block = ((pred_positions - gt_positions) ** 2).sum(dim=-1)
+    B, k, G2 = logits.shape
+    G = int(round(G2 ** 0.5))
 
-    # Build per-block weight tensor
-    is_preplaced = constraints[:, :, 1].float()           # [B, k]
-    weights = 1.0 + (preplaced_weight - 1.0) * is_preplaced   # [B, k]
+    # GT position → grid index  (row-major: index = gy * G + gx)
+    gt_x = gt_positions_norm[:, :, 0].clamp(0.0, 1.0 - 1e-6)   # [B, k]
+    gt_y = gt_positions_norm[:, :, 1].clamp(0.0, 1.0 - 1e-6)   # [B, k]
+    gx   = (gt_x * G).long().clamp(0, G - 1)                    # [B, k]
+    gy   = (gt_y * G).long().clamp(0, G - 1)                    # [B, k]
+    gt_index = (gy * G + gx)                                     # [B, k]
 
-    # Weighted average
-    return (weights * per_block).sum() / weights.sum()
+    # Build validity mask: exclude preplaced and padding tokens
+    is_preplaced = constraints[:, :, 1] > 0   # [B, k]
+    valid        = ~(is_preplaced | key_padding_mask)             # [B, k]
+
+    if valid.sum() == 0:
+        return logits.sum() * 0.0   # differentiable zero
+
+    valid_flat  = valid.view(B * k)               # [B*k]
+    logits_flat = logits.view(B * k, G2)          # [B*k, G*G]
+    gt_flat     = gt_index.view(B * k)            # [B*k]
+
+    return F.cross_entropy(logits_flat[valid_flat], gt_flat[valid_flat])
 
 
 # =============================================================================
@@ -51,34 +64,39 @@ def coord_loss(
 # =============================================================================
 
 if __name__ == "__main__":
-    print("=" * 45)
-    print("coord_loss.py  —  smoke test")
-    print("=" * 45)
+    print("=" * 55)
+    print("coord_loss.py  —  smoke test (cross-entropy)")
+    print("=" * 55)
 
+    G = GRID_SIZE
     B, k = 2, 10
-    pred = torch.rand(B, k, 4, requires_grad=True)
-    gt   = torch.rand(B, k, 4)
 
-    # Mark first 2 blocks of each sample as preplaced
+    logits = torch.randn(B, k, G * G, requires_grad=True)
+    gt     = torch.rand(B, k, 4)   # normalised (x, y, w, h)
+
     constraints = torch.zeros(B, k, 5)
-    constraints[:, :2, 1] = 1.0
+    constraints[:, :2, 1] = 1.0   # blocks 0-1 preplaced (excluded)
 
-    loss = coord_loss(pred, gt, constraints)
+    kpm = torch.zeros(B, k, dtype=torch.bool)
+    kpm[:, -1] = True              # last token is padding (excluded)
 
-    print(f"\nInput  pred shape  : {tuple(pred.shape)}")
-    print(f"Input  gt   shape  : {tuple(gt.shape)}")
+    loss = coord_loss(logits, gt, constraints, kpm)
+
+    print(f"\nlogits shape       : {tuple(logits.shape)}")
+    print(f"gt shape           : {tuple(gt.shape)}")
     print(f"Loss value         : {loss.item():.6f}")
-    assert loss.ndim == 0, "Expected scalar output"
-    assert loss.item() >= 0, "Loss must be non-negative"
+    assert loss.ndim == 0, "Expected scalar"
+    assert loss.item() >= 0, "Cross-entropy must be non-negative"
 
     loss.backward()
-    assert pred.grad is not None, "No gradient to pred_positions"
-    print(f"Gradient norm      : {pred.grad.norm().item():.6f}")
+    assert logits.grad is not None, "No gradient to logits"
+    print(f"Gradient norm      : {logits.grad.norm().item():.6f}")
 
-    # Perfect prediction → loss should be 0
-    zero_loss = coord_loss(gt, gt, constraints)
-    assert zero_loss.item() < 1e-6, f"Expected ~0, got {zero_loss.item()}"
-    print(f"Perfect pred loss  : {zero_loss.item():.2e}  (expected ~0)")
+    # All-preplaced + padding → dummy zero loss
+    kpm_all = torch.ones(B, k, dtype=torch.bool)
+    zero_loss = coord_loss(logits.detach(), gt, constraints, kpm_all)
+    print(f"All-excluded loss  : {zero_loss.item():.6f}  (expected 0)")
+    assert zero_loss.item() == 0.0
 
     print("\nSmoke test passed.")
-    print("=" * 45)
+    print("=" * 55)

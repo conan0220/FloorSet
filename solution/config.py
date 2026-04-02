@@ -59,6 +59,7 @@ RAW_FEATURE_DIM = 18
 # =============================================================================
 # Model Architecture
 # =============================================================================
+GRID_SIZE         = 64   # discrete placement grid (G × G)
 D_MODEL           = 256
 NUM_HEADS         = 8
 NUM_ENCODER_LAYERS = 6

@@ -30,7 +30,7 @@ sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
 
 from config import (
     BATCH_SIZE, MAX_EPOCHS, PATIENCE, LEARNING_RATE, WARMUP_STEPS,
-    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION, LAMBDA_OVERLAP, LAMBDA_BLOCK_AREA, LAMBDA_NONNEG,
+    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION,
     VALIDATE_EVERY, VIZ_BLOCK_SIZES, RAW_FEATURE_DIM,
     LOGS_DIR, VIZ_DIR, CHECKPOINT_DIR, CONTEST_DIR,
     CACHE_DIR, CACHE_PRELOAD,
@@ -46,13 +46,10 @@ from data.floorset_loader import (
     build_sort_inv,
 )
 from model.transformer_floorplan import TransformerFloorplan
-from loss.coord_loss     import coord_loss
+from loss.coord_loss      import coord_loss
 from loss.wirelength_loss import wirelength_loss
-from loss.area_loss      import area_loss
-from loss.violation_loss import violation_loss
-from loss.overlap_loss   import overlap_loss
-from loss.block_area_loss import block_area_loss
-from loss.nonneg_loss     import nonneg_loss
+from loss.area_loss       import area_loss
+from loss.violation_loss  import violation_loss
 
 
 # =============================================================================
@@ -205,21 +202,15 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
     # De-normalise for HPWL / area losses (raw pixel scale)
     pred_raw = pred_norm * crefs.view(-1, 1, 1)  # [B, k, 4]
 
-    l_coord      = coord_loss(pred_norm, gtn, cons)
-    l_wl         = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
-    l_area       = area_loss(pred_raw, abase)
-    l_viol       = violation_loss(pred_norm, gtn, cons)
-    l_overlap    = overlap_loss(pred_norm)
-    l_block_area = block_area_loss(pred_norm, tf, kpm)
-    l_nonneg     = nonneg_loss(pred_norm, kpm)
+    l_coord = coord_loss(pred_norm, gtn, cons)
+    l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
+    l_area  = area_loss(pred_raw, abase)
+    l_viol  = violation_loss(pred_norm, cons)
 
     total = (l_coord
-             + LAMBDA_WIRELENGTH  * l_wl
-             + LAMBDA_AREA        * l_area
-             + LAMBDA_VIOLATION   * l_viol
-             + LAMBDA_OVERLAP     * l_overlap
-             + LAMBDA_BLOCK_AREA  * l_block_area
-             + LAMBDA_NONNEG      * l_nonneg)
+             + LAMBDA_WIRELENGTH * l_wl
+             + LAMBDA_AREA       * l_area
+             + LAMBDA_VIOLATION  * l_viol)
 
     return total, {
         "total":      total.item(),
@@ -227,9 +218,6 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
         "wirelength": l_wl.item(),
         "area":       l_area.item(),
         "violation":  l_viol.item(),
-        "overlap":    l_overlap.item(),
-        "block_area": l_block_area.item(),
-        "nonneg":     l_nonneg.item(),
     }, pred_norm
 
 
@@ -381,24 +369,15 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
 
     pred_raw = pred_norm * ref   # [1, k, 4]
 
-    tf_feat = s["token_features"][:k].unsqueeze(0).to(device)   # [1, k, 18]
-    kpm     = torch.zeros(1, k, dtype=torch.bool, device=device) # no padding
-
     with torch.no_grad():
-        l_coord      = coord_loss(pred_norm, gtn, cons).item()
-        l_wl         = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
-        l_area       = area_loss(pred_raw, abase).item()
-        l_viol       = violation_loss(pred_norm, gtn, cons).item()
-        l_overlap    = overlap_loss(pred_norm).item()
-        l_block_area = block_area_loss(pred_norm, tf_feat, kpm).item()
-        l_nonneg     = nonneg_loss(pred_norm, kpm).item()
-        total        = (l_coord
-                        + LAMBDA_WIRELENGTH  * l_wl
-                        + LAMBDA_AREA        * l_area
-                        + LAMBDA_VIOLATION   * l_viol
-                        + LAMBDA_OVERLAP     * l_overlap
-                        + LAMBDA_BLOCK_AREA  * l_block_area
-                        + LAMBDA_NONNEG      * l_nonneg)
+        l_coord = coord_loss(pred_norm, gtn, cons).item()
+        l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
+        l_area  = area_loss(pred_raw, abase).item()
+        l_viol  = violation_loss(pred_norm, cons).item()
+        total   = (l_coord
+                   + LAMBDA_WIRELENGTH * l_wl
+                   + LAMBDA_AREA       * l_area
+                   + LAMBDA_VIOLATION  * l_viol)
 
     return {
         "total":      total,
@@ -406,9 +385,6 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
         "wirelength": l_wl,
         "area":       l_area,
         "violation":  l_viol,
-        "overlap":    l_overlap,
-        "block_area": l_block_area,
-        "nonneg":     l_nonneg,
     }
 
 
@@ -572,10 +548,7 @@ def _save_viz(gt_raw, pred_raw, epoch: int, block_count: int,
         f"coord={loss_parts['coord']:.4f}  "
         f"wl={loss_parts['wirelength']:.4f}  "
         f"area={loss_parts['area']:.4f}  "
-        f"viol={loss_parts['violation']:.4f}  "
-        f"overlap={loss_parts['overlap']:.4f}  "
-        f"block_area={loss_parts['block_area']:.4f}  "
-        f"nonneg={loss_parts['nonneg']:.4f}"
+        f"viol={loss_parts['violation']:.4f}"
     )
     fig.text(0.5, 0.01, loss_text, ha="center", va="bottom",
              fontsize=8, family="monospace",
@@ -691,9 +664,6 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
                 print(f"    wirelength = {loss_parts['wirelength']}")
                 print(f"    area       = {loss_parts['area']}")
                 print(f"    violation  = {loss_parts['violation']}")
-                print(f"    overlap    = {loss_parts['overlap']}")
-                print(f"    block_area = {loss_parts['block_area']}")
-                print(f"    nonneg     = {loss_parts['nonneg']}")
                 print(f"    total      = {loss_parts['total']}")
                 print(f"    pred min/max/mean = {p.min().item():.4e} / {p.max().item():.4e} / {p.mean().item():.4e}"
                       f"  nan={torch.isnan(p).any().item()} inf={torch.isinf(p).any().item()}")
@@ -721,9 +691,6 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
                       f"  wl={loss_parts['wirelength']:.4f}"
                       f"  area={loss_parts['area']:.4f}"
                       f"  viol={loss_parts['violation']:.4f}"
-                      f"  overlap={loss_parts['overlap']:.4f}"
-                      f"  block_area={loss_parts['block_area']:.4f}"
-                      f"  nonneg={loss_parts['nonneg']:.4f}"
                       f"  lr={lr_now:.2e}")
 
         # ── Epoch-end logging ─────────────────────────────────────────────

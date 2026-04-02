@@ -1,7 +1,7 @@
 """
 L_violation — soft constraint violation penalty.
 
-L_violation = V_grouping + V_mib + V_boundary + V_fixed + V_preplaced
+L_violation = V_grouping + V_mib + V_boundary + V_overlap
 
   V_grouping : all is_cluster==1 blocks treated as one group;
                penalty = sum of centroid distances to the group mean centroid.
@@ -18,13 +18,16 @@ L_violation = V_grouping + V_mib + V_boundary + V_fixed + V_preplaced
                    bit 2 (4)  → block bottom edge must touch bbox y_min
                    bit 3 (8)  → block top   edge must touch bbox y_max
 
-  V_fixed    : is_fixed_shape==1 blocks; penalty = L2( pred(w,h) - gt(w,h) ).
+  V_overlap  : all block pair (i, j) pairwise overlap area sum:
+                   overlap_x = max(0, min(x̂ᵢ+ŵᵢ, x̂ⱼ+ŵⱼ) - max(x̂ᵢ, x̂ⱼ))
+                   overlap_y = max(0, min(ŷᵢ+ĥᵢ, ŷⱼ+ĥⱼ) - max(ŷᵢ, ŷⱼ))
+                   V_overlap = sum of (overlap_x * overlap_y) for all i < j
 
-  V_preplaced: is_preplaced==1 blocks; penalty = L2( pred(x,y,w,h) - gt(x,y,w,h) ).
+All components are computed in normalised space.
+V_fixed and V_preplaced are handled by the Regression Head architecture and
+are therefore not included here.
 
-All violations are summed then divided by batch size B.
-pred_positions_norm and gt_positions_norm must be in the same (normalised) scale.
-constraints[:, :, 5] layout: [is_fixed_shape, is_preplaced, is_mib, is_cluster, boundary_code].
+constraints layout: [is_fixed_shape, is_preplaced, is_mib, is_cluster, boundary_code].
 """
 
 import sys
@@ -37,14 +40,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # solution/
 
 def violation_loss(
     pred_positions_norm: torch.Tensor,   # [B, k, 4]  (x, y, w, h), normalised
-    gt_positions_norm:   torch.Tensor,   # [B, k, 4]  GT in same scale
     constraints:         torch.Tensor,   # [B, k, 5]
 ) -> torch.Tensor:
     """
-    Returns scalar: total soft-constraint violation averaged over the batch.
+    Returns scalar: total soft-constraint violation summed over the batch.
     """
     pred = pred_positions_norm
-    gt   = gt_positions_norm
     B, k, _ = pred.shape
     device   = pred.device
 
@@ -63,27 +64,25 @@ def violation_loss(
     bbox_ymax = y_top.max(dim=1).values             # [B]
 
     # ── Constraint masks ───────────────────────────────────────────
-    is_fixed     = constraints[:, :, 0].float()     # [B, k]
-    is_preplaced = constraints[:, :, 1].float()     # [B, k]
-    is_mib       = constraints[:, :, 2].float()     # [B, k]
-    is_cluster   = constraints[:, :, 3].float()     # [B, k]
-    bcode        = constraints[:, :, 4].long()      # [B, k]  bitmask int
+    is_mib     = constraints[:, :, 2].float()       # [B, k]
+    is_cluster = constraints[:, :, 3].float()       # [B, k]
+    bcode      = constraints[:, :, 4].long()        # [B, k]  bitmask int
 
     # ── V_grouping ─────────────────────────────────────────────────
     n_clus   = is_cluster.sum(dim=1, keepdim=True).clamp(min=1)          # [B, 1]
     mean_cx  = (cx * is_cluster).sum(dim=1, keepdim=True) / n_clus       # [B, 1]
     mean_cy  = (cy * is_cluster).sum(dim=1, keepdim=True) / n_clus       # [B, 1]
-    dist_clus = ((cx - mean_cx).pow(2) + (cy - mean_cy).pow(2) + 1e-8).sqrt()   # [B, k]
+    dist_clus = ((cx - mean_cx).pow(2) + (cy - mean_cy).pow(2) + 1e-8).sqrt()
     v_grouping = (dist_clus * is_cluster).sum()
 
     # ── V_mib ──────────────────────────────────────────────────────
-    pw       = pred[:, :, 2]                                              # [B, k]
-    ph       = pred[:, :, 3]                                              # [B, k]
-    n_mib    = is_mib.sum(dim=1, keepdim=True).clamp(min=1)              # [B, 1]
-    mean_w   = (pw * is_mib).sum(dim=1, keepdim=True) / n_mib            # [B, 1]
-    mean_h   = (ph * is_mib).sum(dim=1, keepdim=True) / n_mib            # [B, 1]
-    dist_mib = ((pw - mean_w).pow(2) + (ph - mean_h).pow(2) + 1e-8).sqrt()      # [B, k]
-    v_mib    = (dist_mib * is_mib).sum()
+    pw    = pred[:, :, 2]                                                 # [B, k]
+    ph    = pred[:, :, 3]                                                 # [B, k]
+    n_mib = is_mib.sum(dim=1, keepdim=True).clamp(min=1)                 # [B, 1]
+    mean_w = (pw * is_mib).sum(dim=1, keepdim=True) / n_mib              # [B, 1]
+    mean_h = (ph * is_mib).sum(dim=1, keepdim=True) / n_mib              # [B, 1]
+    dist_mib = ((pw - mean_w).pow(2) + (ph - mean_h).pow(2) + 1e-8).sqrt()
+    v_mib = (dist_mib * is_mib).sum()
 
     # ── V_boundary ─────────────────────────────────────────────────
     has_left  = (bcode & 1).float()                                       # [B, k]
@@ -98,17 +97,26 @@ def violation_loss(
 
     v_boundary = (pen_left + pen_right + pen_bot + pen_top).sum()
 
-    # ── V_fixed ────────────────────────────────────────────────────
-    diff_wh  = (pred[:, :, 2:4] - gt[:, :, 2:4]).pow(2).sum(-1).add(1e-8).sqrt()   # [B, k]
-    v_fixed  = (diff_wh * is_fixed).sum()
+    # ── V_overlap ──────────────────────────────────────────────────
+    x_end = x_right                                                       # [B, k]
+    y_end = y_top                                                         # [B, k]
 
-    # ── V_preplaced ────────────────────────────────────────────────
-    diff_all    = (pred - gt).pow(2).sum(-1).add(1e-8).sqrt()                        # [B, k]
-    v_preplaced = (diff_all * is_preplaced).sum()
+    ov_x = (
+        torch.minimum(x_end.unsqueeze(2), x_end.unsqueeze(1))
+        - torch.maximum(x_left.unsqueeze(2), x_left.unsqueeze(1))
+    ).clamp(min=0)                                                        # [B, k, k]
 
-    # ── Total, averaged over batch ─────────────────────────────────
-    total = v_grouping + v_mib + v_boundary + v_fixed + v_preplaced
-    return total / B
+    ov_y = (
+        torch.minimum(y_end.unsqueeze(2), y_end.unsqueeze(1))
+        - torch.maximum(y_bot.unsqueeze(2), y_bot.unsqueeze(1))
+    ).clamp(min=0)                                                        # [B, k, k]
+
+    ov_area = ov_x * ov_y                                                 # [B, k, k]
+    triu_mask = torch.triu(torch.ones(k, k, device=device), diagonal=1)
+    n_pairs = max(k * (k - 1) / 2, 1)
+    v_overlap = (ov_area * triu_mask.unsqueeze(0)).sum() / n_pairs
+
+    return v_grouping + v_mib + v_boundary + v_overlap
 
 
 # =============================================================================
@@ -124,21 +132,17 @@ if __name__ == "__main__":
     B, k = 2, 10
 
     pred_norm = (torch.rand(B, k, 4) * 0.8).detach().requires_grad_(True)
-    gt_norm   = torch.rand(B, k, 4) * 0.8
 
     # Constraints: [is_fixed_shape, is_preplaced, is_mib, is_cluster, boundary_code]
     constraints = torch.zeros(B, k, 5)
-    constraints[:, 0, 1] = 1.0                 # block 0: preplaced
-    constraints[:, 1, 0] = 1.0                 # block 1: fixed-shape
     constraints[:, 2:4, 2] = 1.0               # blocks 2,3: mib
     constraints[:, 4:6, 3] = 1.0               # blocks 4,5: cluster
     constraints[:, 6, 4] = 1.0                 # block 6: left boundary (code=1)
     constraints[:, 7, 4] = 6.0                 # block 7: right+bottom (code=6)
 
-    loss = violation_loss(pred_norm, gt_norm, constraints)
+    loss = violation_loss(pred_norm, constraints)
 
     print(f"\npred_positions_norm : {tuple(pred_norm.shape)}")
-    print(f"gt_positions_norm   : {tuple(gt_norm.shape)}")
     print(f"constraints         : {tuple(constraints.shape)}")
     print(f"Loss value          : {loss.item():.6f}")
     assert loss.ndim == 0, "Expected scalar"
@@ -148,36 +152,17 @@ if __name__ == "__main__":
     assert pred_norm.grad is not None, "No gradient to pred_positions_norm"
     print(f"Gradient norm       : {pred_norm.grad.norm().item():.6f}")
 
-    # Perfect prediction — test without boundary constraints so that
-    # V_fixed=0, V_preplaced=0, V_grouping=0 (identical positions), V_mib=0
-    constraints_no_bdry = constraints.clone()
-    constraints_no_bdry[:, :, 4] = 0.0     # clear boundary codes
-
-    gt_perf = torch.rand(B, k, 4) * 0.5
-    # Make mib blocks identical in (w, h)
-    gt_perf[:, 2:4, 2:4] = gt_perf[:, 2:3, 2:4].expand(-1, 2, -1)
-    # Make cluster blocks identical (same centroid)
-    gt_perf[:, 4:6, :] = gt_perf[:, 4:5, :].expand(-1, 2, -1)
-
-    zero_loss = violation_loss(gt_perf, gt_perf, constraints_no_bdry)
-    print(f"Perfect pred loss   : {zero_loss.item():.2e}  (expected ~0)")
-    assert abs(zero_loss.item()) < 1e-4, f"Expected ~0, got {zero_loss.item()}"
-
-    # Boundary penalty: a block at x_min should give 0 left-penalty
-    pred_bdry = torch.zeros(B, k, 4)
-    pred_bdry[:, :, 2] = 0.1   # w
-    pred_bdry[:, :, 3] = 0.1   # h
-    # Spread x positions so block 6 IS at x_min
+    # No-overlap test: blocks arranged in non-overlapping grid
+    no_ov = torch.zeros(B, k, 4)
     for i in range(k):
-        pred_bdry[:, i, 0] = i * 0.15
-        pred_bdry[:, i, 1] = i * 0.15
-    # block 6 (left boundary, code=1): x_left[6]=0.9; x_min over all=0 → penalty=0.9
-    # Let's instead put block 6 at x_min
-    pred_bdry[:, 6, 0] = 0.0   # left edge at x_min=0
-    cons_bdry = torch.zeros(B, k, 5)
-    cons_bdry[:, 6, 4] = 1.0   # left boundary
-    bdry_loss = violation_loss(pred_bdry.detach(), torch.zeros(B, k, 4), cons_bdry)
-    print(f"Boundary (block at edge) loss : {bdry_loss.item():.2e}  (expected ~0)")
+        no_ov[:, i, 0] = i * 0.1   # x
+        no_ov[:, i, 1] = 0.0       # y
+        no_ov[:, i, 2] = 0.09      # w
+        no_ov[:, i, 3] = 0.09      # h
+    cons_ov = torch.zeros(B, k, 5)
+    ov_loss = violation_loss(no_ov, cons_ov)
+    print(f"No-overlap V_overlap: {ov_loss.item():.2e}  (expected ~0)")
+    assert ov_loss.item() < 1e-6
 
     print("\nSmoke test passed.")
     print("=" * 55)

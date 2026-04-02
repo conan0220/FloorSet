@@ -486,54 +486,60 @@ if __name__ == "__main__":
     from loss.wirelength_loss import wirelength_loss
     from loss.area_loss       import area_loss
     from loss.violation_loss  import violation_loss
-    from loss.overlap_loss    import overlap_loss
-    from loss.block_area_loss import block_area_loss
-    from loss.nonneg_loss     import nonneg_loss
     from config import (
         LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION,
-        LAMBDA_OVERLAP, LAMBDA_BLOCK_AREA, LAMBDA_NONNEG,
     )
 
     n_padded = area_target.shape[0]
-    fp_sol   = torch.zeros(n_padded, 4)
-    metrics  = torch.zeros(8)
+
+    # Build fp_sol from GT polygons ([w, h, x, y] format expected by preprocess_sample)
+    fp_sol = torch.zeros(n_padded, 4)
+    for i in range(block_count):
+        verts = polygons[i]
+        v = verts if isinstance(verts, torch.Tensor) else torch.tensor(verts)
+        v = v[v[:, 0] != -1]
+        if v.numel() > 0:
+            xy_min = v.min(0).values
+            xy_max = v.max(0).values
+            fp_sol[i] = torch.tensor([
+                (xy_max[0] - xy_min[0]).item(),  # w
+                (xy_max[1] - xy_min[1]).item(),  # h
+                xy_min[0].item(),                 # x
+                xy_min[1].item(),                 # y
+            ])
+
     s = preprocess_sample(
         area_target, b2b_conn, p2b_conn,
-        pins_pos, constraints, fp_sol, metrics,
+        pins_pos, constraints, fp_sol, val_metrics,
     )
     device = optimizer._device
     k      = s["block_count"]
     ref    = s["canvas_ref"]
 
-    pred_t = torch.tensor(positions, dtype=torch.float32)          # [k, 4]
-    pred_norm = (pred_t / ref).unsqueeze(0).to(device)              # [1, k, 4]
-    pred_raw  = pred_t.unsqueeze(0).to(device)                      # [1, k, 4]
+    pred_t = torch.tensor(positions, dtype=torch.float32)           # [k, 4]  original order
+    # Re-sort to sorted block order so pred aligns with gtn / cons / wiu
+    sort_idx   = s["sort_idx"]                                       # [k]
+    pred_sorted = pred_t[sort_idx]                                   # [k, 4]  sorted order
+    pred_norm = (pred_sorted / ref).unsqueeze(0).to(device)          # [1, k, 4]
+    pred_raw  = pred_sorted.unsqueeze(0).to(device)                  # [1, k, 4]
 
-    tf_feat = s["token_features"][:k].unsqueeze(0).to(device)
-    gtn     = s["gt_positions_norm"][:k].unsqueeze(0).to(device)
-    cons    = s["constraints_sorted"][:k].unsqueeze(0).to(device)
-    p2b_t   = s["p2b_conn"].unsqueeze(0).to(device)
-    pins_t  = s["pins_pos"].unsqueeze(0).to(device)
-    hbase   = torch.tensor([s["hpwl_baseline"]], device=device)
-    abase   = torch.tensor([s["area_baseline"]], device=device)
-    wiu     = build_w_int_unnorm(b2b_conn, k, s["sort_idx"]).unsqueeze(0).to(device)
-    kpm     = torch.zeros(1, k, dtype=torch.bool, device=device)
+    gtn   = s["gt_positions_norm"][:k].unsqueeze(0).to(device)
+    cons  = s["constraints_sorted"][:k].unsqueeze(0).to(device)
+    p2b_t = s["p2b_conn"].unsqueeze(0).to(device)
+    pins_t = s["pins_pos"].unsqueeze(0).to(device)
+    hbase  = torch.tensor([s["hpwl_baseline"]], device=device)
+    abase  = torch.tensor([s["area_baseline"]], device=device)
+    wiu    = build_w_int_unnorm(b2b_conn, k, s["sort_idx"]).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        l_coord      = coord_loss(pred_norm, gtn, cons).item()
-        l_wl         = wirelength_loss(pred_raw, wiu, pins_t, p2b_t, hbase).item()
-        l_area       = area_loss(pred_raw, abase).item()
-        l_viol       = violation_loss(pred_norm, gtn, cons).item()
-        l_overlap    = overlap_loss(pred_norm).item()
-        l_block_area = block_area_loss(pred_norm, tf_feat, kpm).item()
-        l_nonneg     = nonneg_loss(pred_norm, kpm).item()
-        l_total      = (l_coord
-                        + LAMBDA_WIRELENGTH  * l_wl
-                        + LAMBDA_AREA        * l_area
-                        + LAMBDA_VIOLATION   * l_viol
-                        + LAMBDA_OVERLAP     * l_overlap
-                        + LAMBDA_BLOCK_AREA  * l_block_area
-                        + LAMBDA_NONNEG      * l_nonneg)
+        l_coord = coord_loss(pred_norm, gtn, cons).item()
+        l_wl    = wirelength_loss(pred_raw, wiu, pins_t, p2b_t, hbase).item()
+        l_area  = area_loss(pred_raw, abase).item()
+        l_viol  = violation_loss(pred_norm, cons).item()
+        l_total = (l_coord
+                   + LAMBDA_WIRELENGTH * l_wl
+                   + LAMBDA_AREA       * l_area
+                   + LAMBDA_VIOLATION  * l_viol)
 
     # ── Visualize GT vs Predicted ─────────────────────────────────────────
     # Parse GT positions from polygons
@@ -583,10 +589,7 @@ if __name__ == "__main__":
         f"coord={l_coord:.4f}  "
         f"wl={l_wl:.4f}  "
         f"area={l_area:.4f}  "
-        f"viol={l_viol:.4f}  "
-        f"overlap={l_overlap:.4f}  "
-        f"block_area={l_block_area:.4f}  "
-        f"nonneg={l_nonneg:.4f}"
+        f"viol={l_viol:.4f}"
     )
     fig.text(0.5, 0.01, loss_text, ha="center", va="bottom",
              fontsize=8, family="monospace",

@@ -83,10 +83,11 @@ class TransformerFloorplan(nn.Module):
             gt_positions=gt_positions,
             teacher_forcing=teacher_forcing,
             regression_head=self.head if not teacher_forcing else None,
+            token_features=token_features if not teacher_forcing else None,
         )                                                            # [B, k, d_model]
 
         # 4. Regress to (x, y, w, h)
-        return self.head(dec_out)                                    # [B, k, 4]
+        return self.head(dec_out, token_features)                    # [B, k, 4]
 
 
 # =============================================================================

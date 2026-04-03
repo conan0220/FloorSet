@@ -17,7 +17,6 @@ import matplotlib
 matplotlib.use("Agg")
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import torch
 import torch.nn as nn
 
@@ -50,6 +49,7 @@ from loss.coord_loss      import coord_loss
 from loss.wirelength_loss import wirelength_loss
 from loss.area_loss       import area_loss
 from loss.violation_loss  import violation_loss
+from viz_utils            import save_floorplan_viz
 
 
 # =============================================================================
@@ -469,96 +469,16 @@ def visualize_predictions(
                             source="train", label=f"sample_{idx:04d}")
 
 
-# Block type → (facecolor, legend label)
-_BLOCK_TYPE_COLORS = {
-    "mib":       ("mediumseagreen", "MIB"),
-    "cluster":   ("tomato",         "Cluster"),
-    "fixed":     ("violet",         "Fixed"),
-    "preplaced": ("slategray",      "Preplaced"),
-    "boundary":  ("goldenrod",      "Boundary"),
-    "default":   ("lightsteelblue", "Default"),
-}
-
-
-def _block_color(cons_row):
-    """Return (facecolor, label) for one block given its constraint row [5]."""
-    if cons_row[3] > 0:     # cluster
-        return _BLOCK_TYPE_COLORS["cluster"]
-    if cons_row[0] > 0:     # fixed
-        return _BLOCK_TYPE_COLORS["fixed"]
-    if cons_row[1] > 0:     # preplaced
-        return _BLOCK_TYPE_COLORS["preplaced"]
-    if cons_row[2] > 0:     # mib
-        return _BLOCK_TYPE_COLORS["mib"]
-    if cons_row[4] > 1:     # boundary
-        return _BLOCK_TYPE_COLORS["boundary"]
-    return _BLOCK_TYPE_COLORS["default"]
-
-
 def _save_viz(gt_raw, pred_raw, epoch: int, block_count: int,
               source: str, label: str, loss_parts: dict,
               constraints=None):
-    """
-    source      : "val" or "train"
-    label       : used in filename and title (e.g. "case_21" or "sample_0042")
-    loss_parts  : dict with keys total/coord/wirelength/area/violation/overlap
-    constraints : [k, 5] float tensor (optional); if provided, colors blocks by type
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-
-    # Build per-block colors from type (or fall back to tab20 by index)
-    if constraints is not None:
-        block_colors = [_block_color(constraints[i]) for i in range(block_count)]
-    else:
-        cm = plt.cm.tab20(range(block_count))
-        block_colors = [(cm[i % len(cm)], str(i)) for i in range(block_count)]
-
-    for ax, positions, title in [
-        (axes[0], gt_raw,   f"GT  ({block_count} blocks)"),
-        (axes[1], pred_raw, f"Pred ({block_count} blocks)"),
-    ]:
-        ax.set_title(title)
-        for i in range(block_count):
-            x, y, w, h = positions[i].tolist()
-            facecolor, _ = block_colors[i]
-            rect = mpatches.Rectangle(
-                (x, y), w, h,
-                linewidth=0.8, edgecolor="black",
-                facecolor=facecolor, alpha=0.7,
-            )
-            ax.add_patch(rect)
-        ax.autoscale()
-        ax.set_aspect("equal")
-        ax.set_xlabel("X"); ax.set_ylabel("Y")
-
-    # Type legend (only show types that appear in this sample)
-    if constraints is not None:
-        seen = {lbl: col for col, lbl in block_colors}
-        legend_patches = [
-            mpatches.Patch(facecolor=col, edgecolor="black", label=lbl)
-            for lbl, col in seen.items()
-        ]
-        axes[1].legend(handles=legend_patches, loc="upper right",
-                       fontsize=7, title="Block Type", title_fontsize=7)
-
-    fig.suptitle(f"Epoch {epoch} [{source}] {label}  ({block_count} blocks)")
-
-    loss_text = (
-        f"total={loss_parts['total']:.4f}  "
-        f"coord={loss_parts['coord']:.4f}  "
-        f"wl={loss_parts['wirelength']:.4f}  "
-        f"area={loss_parts['area']:.4f}  "
-        f"viol={loss_parts['violation']:.4f}"
-    )
-    fig.text(0.5, 0.01, loss_text, ha="center", va="bottom",
-             fontsize=8, family="monospace",
-             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
-
-    fig.tight_layout(rect=[0, 0.04, 1, 1])
     out = VIZ_DIR / f"epoch_{epoch:03d}_{source}_{label}.png"
-    fig.savefig(out, dpi=120)
-    plt.close(fig)
-    print(f"  [viz] saved {out.name}")
+    save_floorplan_viz(
+        gt_raw, pred_raw, block_count, out_path=out,
+        title=f"Epoch {epoch} [{source}] {label}  ({block_count} blocks)",
+        loss_parts=loss_parts,
+        constraints=constraints,
+    )
 
 
 # =============================================================================
@@ -709,10 +629,10 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
         # ── Validation every N epochs ─────────────────────────────────────
         if epoch % validate_every == 0:
             visualize_predictions(model, epoch, device, dry_run=smoke_test)
-            # score = run_official_validation(
-                # epoch, log_file, dry_run=smoke_test
-            # )
-            score = 10
+            score = run_official_validation(
+                epoch, log_file, dry_run=smoke_test
+            )
+            # score = 10
 
             if score < best_score:
                 best_score = score

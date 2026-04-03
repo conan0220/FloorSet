@@ -133,6 +133,7 @@ class FloorplanDecoder(nn.Module):
         regression_head: nn.Module    = None,   # inference only
         token_features:  torch.Tensor = None,   # [B, k, 18]  — inference only
         occupancy:       torch.Tensor = None,   # [B, G, G]   — inference only
+        placed_blocks:   list         = None,   # list[list[tuple]] — inference only
     ) -> torch.Tensor:
         """
         Returns:
@@ -173,8 +174,8 @@ class FloorplanDecoder(nn.Module):
                 )                                                    # [B, t+1, d_model]
                 last = dec_out[:, -1:, :]                            # [B, 1, d_model]
 
-                tf_t     = token_features[:, t:t+1, :]              # [B, 1, 18]
-                pred_pos = regression_head(last, tf_t, occupancy)   # [B, 1, 4]
+                tf_t     = token_features[:, t:t+1, :]                        # [B, 1, 18]
+                pred_pos = regression_head(last, tf_t, occupancy, placed_blocks)  # [B, 1, 4]
                 positions.append(pred_pos)
 
                 if t < k - 1:

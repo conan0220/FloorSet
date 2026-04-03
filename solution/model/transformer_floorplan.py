@@ -94,8 +94,11 @@ class TransformerFloorplan(nn.Module):
 
         else:
             # 3b. Autoregressive decode — head called internally per step
-            G         = self.head.G
-            occupancy = torch.zeros(B, G, G, device=device)
+            G             = self.head.G
+            k             = token_features.shape[1]
+            occupancy     = torch.zeros(B, G, G, device=device)
+            placed_blocks = [[] for _ in range(B)]
+            self.head._fallback_count = 0
 
             pred_positions = self.decoder(
                 enc_out,
@@ -103,7 +106,12 @@ class TransformerFloorplan(nn.Module):
                 regression_head=self.head,
                 token_features=token_features,
                 occupancy=occupancy,
+                placed_blocks=placed_blocks,
             )                                                        # [B, k, 4]
+
+            fb = self.head._fallback_count
+            if fb > 0:
+                print(f"[overlap check] fallback_count={fb} / total_placements={B * k}")
 
             return pred_positions
 

@@ -56,6 +56,54 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import D_MODEL, GRID_SIZE
 
 
+# =============================================================================
+# Continuous-level exact overlap check
+# =============================================================================
+
+def place_with_exact_check(
+    logits,         # [G*G] float tensor — single sample, already masked (pass a .clone())
+    placed_blocks,  # list of (x_norm, y_norm, w_norm, h_norm) already placed
+    w_norm,         # float — current block normalised width
+    h_norm,         # float — current block normalised height
+    G,              # int   — grid size
+    max_retry=10,
+):
+    """
+    Greedy placement with continuous-level exact overlap retry.
+
+    Each attempt: argmax → check continuous overlap against placed_blocks.
+    If overlap: set that position to -inf and retry.
+
+    Returns: (x_norm, y_norm, is_fallback)
+      is_fallback=True when all max_retry attempts had overlap.
+    """
+    last_index = None
+    x_norm = y_norm = 0.0
+
+    for _ in range(max_retry):
+        if last_index is not None:
+            logits[last_index] = float('-inf')
+
+        if not torch.isfinite(logits).any():
+            break
+
+        last_index = logits.argmax().item()
+        x_norm     = (last_index % G) / G
+        y_norm     = (last_index // G) / G
+
+        overlap = False
+        for (px, py, pw, ph) in placed_blocks:
+            if (min(x_norm + w_norm, px + pw) - max(x_norm, px) > 0 and
+                    min(y_norm + h_norm, py + ph) - max(y_norm, py) > 0):
+                overlap = True
+                break
+
+        if not overlap:
+            return x_norm, y_norm, False
+
+    return x_norm, y_norm, True
+
+
 class DiscreteRegressionHead(nn.Module):
     """
     Grid-based regression head for floorplan placement.
@@ -78,6 +126,7 @@ class DiscreteRegressionHead(nn.Module):
         self.shared     = nn.Sequential(nn.Linear(d_model, hidden), nn.ReLU())
         self.xy_head    = nn.Linear(hidden, G * G)
         self.ratio_head = nn.Linear(hidden, 1)
+        self._fallback_count = 0   # reset by TransformerFloorplan before each AR pass
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -181,6 +230,7 @@ class DiscreteRegressionHead(nn.Module):
         x:              torch.Tensor,          # [B, k, d_model] or [B, 1, d_model]
         token_features: torch.Tensor,          # [B, k, 18]      or [B, 1, 18]
         occupancy:      torch.Tensor = None,   # [B, G, G]  — inference only
+        placed_blocks:  list         = None,   # list[list[tuple]] — inference only
     ):
         """
         Training (occupancy=None):
@@ -188,7 +238,7 @@ class DiscreteRegressionHead(nn.Module):
 
         Inference (occupancy=[B,G,G]):
             Returns pred_positions [B,1,4]
-            Updates occupancy in-place.
+            Updates occupancy and placed_blocks in-place.
         """
         h         = self.shared(x)          # [..., hidden]
         logits    = self.xy_head(h)          # [..., G*G]
@@ -196,38 +246,76 @@ class DiscreteRegressionHead(nn.Module):
 
         if occupancy is None:
             # ── Training mode ──────────────────────────────────────
-            flat_idx      = logits.argmax(dim=-1)                    # [B, k]
+            flat_idx       = logits.argmax(dim=-1)
             pred_positions = self._build_positions(flat_idx, token_features, ratio_raw)
             return pred_positions, logits
 
         else:
             # ── Inference mode (one step at a time) ────────────────
-            G = self.G
+            G      = self.G
+            B      = x.shape[0]
+            device = x.device
+
             logits_step = logits[:, 0, :]          # [B, G*G]
             tf_step     = token_features[:, 0, :]  # [B, 18]
 
+            # Grid-level occupancy mask
             logits_masked = self.apply_occupancy_mask(logits_step, tf_step, occupancy)
+            # Per-sample fallback: if all positions masked, revert to unmasked
+            all_inf = ~torch.isfinite(logits_masked).any(dim=-1)  # [B]
+            if all_inf.any():
+                logits_masked[all_inf] = logits_step[all_inf]
 
-            # Fallback if entire grid is occupied
-            if not torch.isfinite(logits_masked).any():
-                logits_masked = logits_step
+            # Continuous w, h for exact check and occupancy update
+            pred_w, pred_h = self._decode_size(token_features, ratio_raw)
+            pred_w = pred_w[:, 0]  # [B]
+            pred_h = pred_h[:, 0]  # [B]
 
-            flat_idx = logits_masked.argmax(dim=-1)  # [B]
+            final_x = torch.zeros(B, device=device)
+            final_y = torch.zeros(B, device=device)
 
-            flat_idx_2d    = flat_idx.unsqueeze(1)   # [B, 1]
-            pred_positions = self._build_positions(flat_idx_2d, token_features, ratio_raw)
-
-            # Update occupancy in-place
-            B = x.shape[0]
             for b in range(B):
-                idx    = flat_idx[b].item()
-                gy     = idx // G
-                gx     = idx % G
-                pw     = pred_positions[b, 0, 2].item()
-                ph     = pred_positions[b, 0, 3].item()
-                w_cells = max(1, min(G - gx, int(math.ceil(pw * G))))
-                h_cells = max(1, min(G - gy, int(math.ceil(ph * G))))
-                occupancy[b, gy:gy + h_cells, gx:gx + w_cells] = 1.0
+                is_pre = tf_step[b, 3].item() > 0   # is_preplaced
+
+                if is_pre:
+                    # Hard-constrained: use target x/y directly
+                    final_x[b] = tf_step[b, 6]       # target_x
+                    final_y[b] = tf_step[b, 7]       # target_y
+                    if placed_blocks is not None:
+                        placed_blocks[b].append((
+                            final_x[b].item(), final_y[b].item(),
+                            pred_w[b].item(),  pred_h[b].item(),
+                        ))
+                else:
+                    if placed_blocks is not None:
+                        x_n, y_n, is_fb = place_with_exact_check(
+                            logits_masked[b].clone(),
+                            placed_blocks[b],
+                            pred_w[b].item(),
+                            pred_h[b].item(),
+                            G,
+                        )
+                        if is_fb:
+                            self._fallback_count += 1
+                        final_x[b] = x_n
+                        final_y[b] = y_n
+                        placed_blocks[b].append((x_n, y_n, pred_w[b].item(), pred_h[b].item()))
+                    else:
+                        idx        = logits_masked[b].argmax().item()
+                        final_x[b] = (idx % G) / G
+                        final_y[b] = (idx // G) / G
+
+            pred_positions = torch.stack(
+                [final_x, final_y, pred_w, pred_h], dim=-1
+            ).unsqueeze(1)   # [B, 1, 4]
+
+            # Update grid-level occupancy in-place
+            for b in range(B):
+                x_g = min(int(final_x[b].item() * G), G - 1)
+                y_g = min(int(final_y[b].item() * G), G - 1)
+                w_cells = max(1, min(G - x_g, int(math.ceil(pred_w[b].item() * G))))
+                h_cells = max(1, min(G - y_g, int(math.ceil(pred_h[b].item() * G))))
+                occupancy[b, y_g:y_g + h_cells, x_g:x_g + w_cells] = 1.0
 
             return pred_positions  # [B, 1, 4]
 

@@ -42,7 +42,6 @@ from typing import List, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import torch
 
@@ -63,6 +62,7 @@ from iccad2026_evaluate import (
     calculate_bbox_area,
     check_overlap,
 )
+from viz_utils import save_floorplan_viz
 
 
 # =============================================================================
@@ -442,6 +442,12 @@ class MyOptimizer(FloorplanOptimizer):
 # =============================================================================
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--val-case", type=int, default=21,
+                        help="Block count of the validation case to visualise (default: 21)")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("my_optimizer.py  —  smoke test")
     print("=" * 60)
@@ -449,14 +455,15 @@ if __name__ == "__main__":
     sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
     from lite_dataset_test import FloorplanDatasetLiteTest
 
-    dataset = FloorplanDatasetLiteTest(str(_REPO_ROOT) + "/")
-    sample  = dataset[0]
+    dataset  = FloorplanDatasetLiteTest(str(_REPO_ROOT) + "/")
+    test_idx = args.val_case - 21
+    sample   = dataset[test_idx]
     inputs, labels = sample["input"], sample["label"]
     area_target, b2b_conn, p2b_conn, pins_pos, constraints = inputs
     polygons, val_metrics = labels
 
     block_count = int((area_target != -1).sum().item())
-    print(f"\nValidation case 0: block_count = {block_count}")
+    print(f"\nValidation case (block_count={args.val_case}, idx={test_idx}): actual block_count={block_count}")
 
     optimizer = MyOptimizer(verbose=True)
     positions = optimizer.solve(
@@ -548,6 +555,17 @@ if __name__ == "__main__":
                    + LAMBDA_AREA       * l_area
                    + LAMBDA_VIOLATION  * l_viol)
 
+    print("\n" + "=" * 50)
+    print("Loss Summary")
+    print("=" * 50)
+    print(f"  coord      (×1.0) : {l_coord:.6f}")
+    print(f"  wirelength (×{LAMBDA_WIRELENGTH})  : {l_wl:.6f}")
+    print(f"  area       (×{LAMBDA_AREA})  : {l_area:.6f}")
+    print(f"  violation  (×{LAMBDA_VIOLATION})  : {l_viol:.6f}")
+    print("-" * 50)
+    print(f"  total              : {l_total:.6f}")
+    print("=" * 50)
+
     # ── Visualize GT vs Predicted ─────────────────────────────────────────
     # Parse GT positions from polygons
     gt_positions = []
@@ -569,42 +587,17 @@ if __name__ == "__main__":
         else:
             gt_positions.append((0.0, 0.0, 0.0, 0.0))
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-    colors = plt.cm.tab20(range(block_count))
-
-    for ax, pos_list, title in [
-        (axes[0], gt_positions, f"GT  ({block_count} blocks)"),
-        (axes[1], positions,   f"Pred ({block_count} blocks)"),
-    ]:
-        ax.set_title(title)
-        for i, (x, y, w, h) in enumerate(pos_list):
-            rect = mpatches.Rectangle(
-                (x, y), w, h,
-                linewidth=0.8, edgecolor="black",
-                facecolor=colors[i % len(colors)], alpha=0.7,
-            )
-            ax.add_patch(rect)
-        ax.autoscale()
-        ax.set_aspect("equal")
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-
-    fig.suptitle("Smoke test — validation case 0")
-
-    loss_text = (
-        f"total={l_total:.4f}  "
-        f"coord={l_coord:.4f}  "
-        f"wl={l_wl:.4f}  "
-        f"area={l_area:.4f}  "
-        f"viol={l_viol:.4f}"
+    loss_parts = {
+        "total":      l_total,
+        "coord":      l_coord,
+        "wirelength": l_wl,
+        "area":       l_area,
+        "violation":  l_viol,
+    }
+    save_floorplan_viz(
+        gt_positions, positions, block_count,
+        out_path=_CONTEST_DIR / "smoke_test_viz.png",
+        title="Smoke test — validation case 0",
+        loss_parts=loss_parts,
+        constraints=constraints[:block_count],
     )
-    fig.text(0.5, 0.01, loss_text, ha="center", va="bottom",
-             fontsize=8, family="monospace",
-             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
-
-    fig.tight_layout(rect=[0, 0.04, 1, 1])
-
-    out = _CONTEST_DIR / "smoke_test_viz.png"
-    fig.savefig(out, dpi=120)
-    plt.close(fig)
-    print(f"\n[viz] saved {out}")

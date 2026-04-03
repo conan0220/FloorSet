@@ -47,7 +47,9 @@ def area_loss(
     baseline  = area_baseline.to(pred.device).clamp(min=1e-8)
     gap       = (bbox_area - baseline) / baseline     # [B]
 
-    return gap.mean()
+    # Clamp to non-negative: doing better than baseline is free,
+    # but should not reduce total loss and mask other penalties.
+    return gap.clamp(min=0).mean()
 
 
 # =============================================================================

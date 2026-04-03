@@ -29,7 +29,8 @@ sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
 
 from config import (
     BATCH_SIZE, MAX_EPOCHS, PATIENCE, LEARNING_RATE, WARMUP_STEPS,
-    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION,
+    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_RATIO,
+    LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
     VALIDATE_EVERY, VIZ_BLOCK_SIZES, RAW_FEATURE_DIM,
     LOGS_DIR, VIZ_DIR, CHECKPOINT_DIR, CONTEST_DIR,
     CACHE_DIR, CACHE_PRELOAD,
@@ -48,6 +49,7 @@ from model.transformer_floorplan import TransformerFloorplan
 from loss.coord_loss      import coord_loss
 from loss.wirelength_loss import wirelength_loss
 from loss.area_loss       import area_loss
+from loss.ratio_loss      import ratio_loss
 from loss.violation_loss  import violation_loss
 from viz_utils            import save_floorplan_viz
 from inference            import ar_inference
@@ -206,19 +208,28 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
     l_coord = coord_loss(logits, gtn, cons, kpm)
     l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
     l_area  = area_loss(pred_raw, abase)
-    l_viol  = violation_loss(pred_norm, cons)
+    l_ratio = ratio_loss(pred_norm, gtn, cons, kpm)
+    l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
 
     total = (l_coord
              + LAMBDA_WIRELENGTH * l_wl
              + LAMBDA_AREA       * l_area
-             + LAMBDA_VIOLATION  * l_viol)
+             + LAMBDA_RATIO      * l_ratio
+             + LAMBDA_GROUPING   * l_grouping
+             + LAMBDA_MIB        * l_mib
+             + LAMBDA_BOUNDARY   * l_boundary
+             + LAMBDA_OVERLAP    * l_overlap)
 
     return total, {
         "total":      total.item(),
         "coord":      l_coord.item(),
         "wirelength": l_wl.item(),
         "area":       l_area.item(),
-        "violation":  l_viol.item(),
+        "ratio":      l_ratio.item(),
+        "grouping":   l_grouping.item(),
+        "mib":        l_mib.item(),
+        "boundary":   l_boundary.item(),
+        "overlap":    l_overlap.item(),
     }, pred_norm
 
 
@@ -370,20 +381,35 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
 
     pred_raw = pred_norm * ref   # [1, k, 4]
 
+    kpm_viz = torch.zeros(1, k, dtype=torch.bool, device=device)
+
     with torch.no_grad():
-        l_wl   = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
-        l_area = area_loss(pred_raw, abase).item()
-        l_viol = violation_loss(pred_norm, cons).item()
-        total  = (LAMBDA_WIRELENGTH * l_wl
-                  + LAMBDA_AREA       * l_area
-                  + LAMBDA_VIOLATION  * l_viol)
+        l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
+        l_area  = area_loss(pred_raw, abase).item()
+        l_ratio = ratio_loss(pred_norm, gtn, cons, kpm_viz).item()
+        l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
+        l_grouping  = l_grouping.item()
+        l_mib       = l_mib.item()
+        l_boundary  = l_boundary.item()
+        l_overlap   = l_overlap.item()
+        total = (LAMBDA_WIRELENGTH * l_wl
+                 + LAMBDA_AREA     * l_area
+                 + LAMBDA_RATIO    * l_ratio
+                 + LAMBDA_GROUPING * l_grouping
+                 + LAMBDA_MIB      * l_mib
+                 + LAMBDA_BOUNDARY * l_boundary
+                 + LAMBDA_OVERLAP  * l_overlap)
 
     return {
         "total":      total,
         "coord":      None,   # AR mode has no logits
         "wirelength": l_wl,
         "area":       l_area,
-        "violation":  l_viol,
+        "ratio":      l_ratio,
+        "grouping":   l_grouping,
+        "mib":        l_mib,
+        "boundary":   l_boundary,
+        "overlap":    l_overlap,
     }
 
 
@@ -577,7 +603,11 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
                 print(f"    coord      = {loss_parts['coord']}")
                 print(f"    wirelength = {loss_parts['wirelength']}")
                 print(f"    area       = {loss_parts['area']}")
-                print(f"    violation  = {loss_parts['violation']}")
+                print(f"    ratio      = {loss_parts['ratio']}")
+                print(f"    grouping   = {loss_parts['grouping']}")
+                print(f"    mib        = {loss_parts['mib']}")
+                print(f"    boundary   = {loss_parts['boundary']}")
+                print(f"    overlap    = {loss_parts['overlap']}")
                 print(f"    total      = {loss_parts['total']}")
                 print(f"    pred min/max/mean = {p.min().item():.4e} / {p.max().item():.4e} / {p.mean().item():.4e}"
                       f"  nan={torch.isnan(p).any().item()} inf={torch.isinf(p).any().item()}")
@@ -604,7 +634,11 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
                       f"  coord={loss_parts['coord']:.4f}"
                       f"  wl={loss_parts['wirelength']:.4f}"
                       f"  area={loss_parts['area']:.4f}"
-                      f"  viol={loss_parts['violation']:.4f}"
+                      f"  ratio={loss_parts['ratio']:.4f}"
+                      f"  grp={loss_parts['grouping']:.4f}"
+                      f"  mib={loss_parts['mib']:.4f}"
+                      f"  bnd={loss_parts['boundary']:.4f}"
+                      f"  ovlp={loss_parts['overlap']:.4f}"
                       f"  lr={lr_now:.2e}")
 
         # ── Epoch-end logging ─────────────────────────────────────────────

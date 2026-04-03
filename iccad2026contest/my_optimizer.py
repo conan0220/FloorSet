@@ -532,9 +532,11 @@ if __name__ == "__main__":
     from data.floorset_loader import preprocess_sample, build_w_int_unnorm
     from loss.wirelength_loss import wirelength_loss
     from loss.area_loss       import area_loss
+    from loss.ratio_loss      import ratio_loss
     from loss.violation_loss  import violation_loss
     from config import (
-        LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION,
+        LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_RATIO,
+        LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
     )
 
     n_padded = area_target.shape[0]
@@ -578,21 +580,36 @@ if __name__ == "__main__":
     abase  = torch.tensor([s["area_baseline"]], device=device)
     wiu    = build_w_int_unnorm(b2b_conn, k, s["sort_idx"]).unsqueeze(0).to(device)
 
+    kpm_inf = torch.zeros(1, k, dtype=torch.bool, device=device)
+
     with torch.no_grad():
-        l_wl   = wirelength_loss(pred_raw, wiu, pins_t, p2b_t, hbase).item()
-        l_area = area_loss(pred_raw, abase).item()
-        l_viol = violation_loss(pred_norm, cons).item()
+        l_wl    = wirelength_loss(pred_raw, wiu, pins_t, p2b_t, hbase).item()
+        l_area  = area_loss(pred_raw, abase).item()
+        l_ratio = ratio_loss(pred_norm, gtn, cons, kpm_inf).item()
+        l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
+        l_grouping = l_grouping.item()
+        l_mib      = l_mib.item()
+        l_boundary = l_boundary.item()
+        l_overlap  = l_overlap.item()
         l_total = (LAMBDA_WIRELENGTH * l_wl
-                   + LAMBDA_AREA       * l_area
-                   + LAMBDA_VIOLATION  * l_viol)
+                   + LAMBDA_AREA     * l_area
+                   + LAMBDA_RATIO    * l_ratio
+                   + LAMBDA_GROUPING * l_grouping
+                   + LAMBDA_MIB      * l_mib
+                   + LAMBDA_BOUNDARY * l_boundary
+                   + LAMBDA_OVERLAP  * l_overlap)
 
     print("\n" + "=" * 50)
     print("Loss Summary")
     print("=" * 50)
-    print(f"  coord      (×1.0) : unknown (AR mode has no logits)")
-    print(f"  wirelength (×{LAMBDA_WIRELENGTH})  : {l_wl:.6f}")
-    print(f"  area       (×{LAMBDA_AREA})  : {l_area:.6f}")
-    print(f"  violation  (×{LAMBDA_VIOLATION})  : {l_viol:.6f}")
+    print(f"  coord      (×1.0)              : unknown (AR mode has no logits)")
+    print(f"  wirelength (×{LAMBDA_WIRELENGTH})           : {l_wl:.6f}")
+    print(f"  area       (×{LAMBDA_AREA})           : {l_area:.6f}")
+    print(f"  ratio      (×{LAMBDA_RATIO})           : {l_ratio:.6f}")
+    print(f"  grouping   (×{LAMBDA_GROUPING})           : {l_grouping:.6f}")
+    print(f"  mib        (×{LAMBDA_MIB})           : {l_mib:.6f}")
+    print(f"  boundary   (×{LAMBDA_BOUNDARY})           : {l_boundary:.6f}")
+    print(f"  overlap    (×{LAMBDA_OVERLAP})           : {l_overlap:.6f}")
     print("-" * 50)
     print(f"  total (excl. coord): {l_total:.6f}")
     print("=" * 50)
@@ -623,7 +640,11 @@ if __name__ == "__main__":
         "coord":      None,
         "wirelength": l_wl,
         "area":       l_area,
-        "violation":  l_viol,
+        "ratio":      l_ratio,
+        "grouping":   l_grouping,
+        "mib":        l_mib,
+        "boundary":   l_boundary,
+        "overlap":    l_overlap,
     }
     save_floorplan_viz(
         gt_positions, positions, block_count,

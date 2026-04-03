@@ -12,6 +12,8 @@ Excluded from the loss:
 import sys
 from pathlib import Path
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -56,7 +58,10 @@ def coord_loss(
     logits_flat = logits.view(B * k, G2)          # [B*k, G*G]
     gt_flat     = gt_index.view(B * k)            # [B*k]
 
-    return F.cross_entropy(logits_flat[valid_flat], gt_flat[valid_flat])
+    # Normalise by maximum possible cross-entropy (uniform distribution over G*G cells)
+    # so the loss is in [0, 1] regardless of grid size.
+    ce = F.cross_entropy(logits_flat[valid_flat], gt_flat[valid_flat])
+    return ce / math.log(G * G)
 
 
 # =============================================================================

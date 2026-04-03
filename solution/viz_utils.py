@@ -40,7 +40,7 @@ def save_floorplan_viz(
     block_count: int,
     out_path,         # Path or str — where to save the PNG
     title: str = "",
-    loss_parts: dict = None,  # keys: total, coord, wirelength, area, violation
+    loss_parts: dict = None,  # keys: total, coord, wirelength, area, grouping, mib, boundary, overlap
     constraints=None,         # [k, 5] tensor (optional)
 ):
     """
@@ -98,12 +98,17 @@ def save_floorplan_viz(
 
     if loss_parts is not None:
         coord_str = "unknown" if loss_parts['coord'] is None else f"{loss_parts['coord']:.4f}"
+        ratio_str = "unknown" if loss_parts.get('ratio') is None else f"{loss_parts['ratio']:.4f}"
         loss_text = (
             f"total={loss_parts['total']:.4f}  "
             f"coord={coord_str}  "
             f"wl={loss_parts['wirelength']:.4f}  "
             f"area={loss_parts['area']:.4f}  "
-            f"viol={loss_parts['violation']:.4f}"
+            f"ratio={ratio_str}  "
+            f"grp={loss_parts['grouping']:.4f}  "
+            f"mib={loss_parts['mib']:.4f}  "
+            f"bnd={loss_parts['boundary']:.4f}  "
+            f"ovlp={loss_parts['overlap']:.4f}"
         )
         fig.text(0.5, 0.01, loss_text, ha="center", va="bottom",
                  fontsize=8, family="monospace",

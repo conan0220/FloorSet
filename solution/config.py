@@ -22,7 +22,7 @@ SHARD_SIZE = 2000
 
 # Load entire cache into RAM at training startup (requires ~50 GB for 1 M samples).
 # Set True when RAM is sufficient; eliminates all disk I/O during training.
-CACHE_PRELOAD = True
+CACHE_PRELOAD = False
 
 # =============================================================================
 # Data
@@ -73,7 +73,7 @@ DROPOUT           = 0.1
 # =============================================================================
 # Training
 # =============================================================================
-BATCH_SIZE    = 64
+BATCH_SIZE    = 128
 MAX_EPOCHS    = 100
 PATIENCE      = 10          # early stopping patience (epochs)
 
@@ -84,7 +84,11 @@ GRAD_CLIP_NORM = 1.0
 # Loss weights
 LAMBDA_WIRELENGTH = 0.3     # weight for L_wirelength
 LAMBDA_AREA       = 0.3     # weight for L_area
-LAMBDA_VIOLATION  = 0.4     # weight for L_violation
+LAMBDA_RATIO      = 0.5     # weight for L_ratio     (aspect ratio supervision)
+LAMBDA_GROUPING   = 0.1     # weight for V_grouping  (cluster centroid distance)
+LAMBDA_MIB        = 0.1     # weight for V_mib       (macro-in-block size deviation)
+LAMBDA_BOUNDARY   = 0.1     # weight for V_boundary  (boundary gap penalty)
+LAMBDA_OVERLAP    = 50.0    # weight for V_overlap   (pairwise overlap area)
 
 # Extra weight on preplaced blocks in L_coord
 PREPLACED_COORD_WEIGHT = 5.0

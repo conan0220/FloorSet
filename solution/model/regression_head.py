@@ -76,9 +76,11 @@ def place_with_exact_check(
 
     Returns: (x_norm, y_norm, is_fallback)
       is_fallback=True when all max_retry attempts had overlap.
+      On fallback, returns the top-1 position (highest logit) so the model
+      receives gradient signal from the overlap penalty.
     """
+    top1_index = None
     last_index = None
-    x_norm = y_norm = 0.0
 
     for _ in range(max_retry):
         if last_index is not None:
@@ -88,8 +90,11 @@ def place_with_exact_check(
             break
 
         last_index = logits.argmax().item()
-        x_norm     = (last_index % G) / G
-        y_norm     = (last_index // G) / G
+        if top1_index is None:
+            top1_index = last_index   # remember the best candidate
+
+        x_norm = (last_index % G) / G
+        y_norm = (last_index // G) / G
 
         overlap = False
         for (px, py, pw, ph) in placed_blocks:
@@ -101,7 +106,10 @@ def place_with_exact_check(
         if not overlap:
             return x_norm, y_norm, False
 
-    return x_norm, y_norm, True
+    # Fallback: return top-1 position so v_overlap can penalise it
+    if top1_index is None:
+        top1_index = 0
+    return (top1_index % G) / G, (top1_index // G) / G, True
 
 
 class DiscreteRegressionHead(nn.Module):

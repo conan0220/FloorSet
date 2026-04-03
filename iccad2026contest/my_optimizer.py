@@ -338,10 +338,11 @@ class MyOptimizer(FloorplanOptimizer):
     runs the trained Encoder-Decoder Transformer in AR mode inside solve().
     """
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, checkpoint: str = None):
         super().__init__(verbose)
         self._model  = None
         self._device = None
+        self._checkpoint = checkpoint
         self._load_model()
 
     # ------------------------------------------------------------------
@@ -352,15 +353,23 @@ class MyOptimizer(FloorplanOptimizer):
         from config import CHECKPOINT_DIR
         from model.transformer_floorplan import TransformerFloorplan
 
-        best_ck   = CHECKPOINT_DIR / "best.pt"
-        latest_ck = CHECKPOINT_DIR / "latest.pt"
-
-        if best_ck.exists():
-            ck_path = best_ck
-        elif latest_ck.exists():
-            ck_path = latest_ck
+        if self._checkpoint is not None:
+            ck_path = Path(self._checkpoint)
+            if not ck_path.is_absolute():
+                ck_path = CHECKPOINT_DIR / ck_path
+            if not ck_path.exists():
+                raise FileNotFoundError(f"Checkpoint not found: {ck_path}")
         else:
-            ck_path = None
+            best_ck   = CHECKPOINT_DIR / "best.pt"
+            latest_ck = CHECKPOINT_DIR / "latest.pt"
+            if best_ck.exists():
+                ck_path = best_ck
+            elif latest_ck.exists():
+                ck_path = latest_ck
+                if self.verbose:
+                    print("[MyOptimizer] best.pt not found — falling back to latest.pt")
+            else:
+                ck_path = None
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model  = TransformerFloorplan().to(device)
@@ -369,7 +378,7 @@ class MyOptimizer(FloorplanOptimizer):
             ck = torch.load(ck_path, map_location=device, weights_only=False)
             model.load_state_dict(ck["model_state"])
             if self.verbose:
-                print(f"[MyOptimizer] Loaded checkpoint: {ck_path.name}")
+                print(f"[MyOptimizer] Loaded checkpoint: {ck_path}")
         else:
             if self.verbose:
                 print("[MyOptimizer] No checkpoint found — using random init.")
@@ -390,18 +399,25 @@ class MyOptimizer(FloorplanOptimizer):
         p2b_connectivity: torch.Tensor,      # [n_edges, 3]
         pins_pos:         torch.Tensor,      # [n_pins, 2]
         constraints:      torch.Tensor,      # [n_padded, 5]
+        fp_sol:           torch.Tensor = None,  # [n_padded, 4] [w,h,x,y] optional
     ) -> List[Tuple[float, float, float, float]]:
         """
         Transformer autoregressive inference.
 
+        fp_sol: optional [n_padded, 4] tensor with [w, h, x, y] for fixed/preplaced
+                blocks.  When provided (e.g. smoke test from GT litelabel), the
+                regression head can correctly override w/h/x/y for constrained blocks.
+                When None (contest evaluation), falls back to zeros — target dims
+                unavailable through the official API.
+
         Returns List[(x, y, w, h)], length = block_count, in original block order.
         """
         from data.floorset_loader import preprocess_sample
+        from inference import ar_inference
 
-        # Build dummy fp_sol (zeros): features 4-7 will be 0 at inference
-        # (target_w/h/x/y unavailable without GT solution)
         n_padded = area_targets.shape[0]
-        fp_sol   = torch.zeros(n_padded, 4)   # [w, h, x, y] — zeroed
+        if fp_sol is None:
+            fp_sol = torch.zeros(n_padded, 4)
         metrics  = torch.zeros(8)
 
         # Full preprocessing pipeline (sort, features, w_int, …)
@@ -410,21 +426,15 @@ class MyOptimizer(FloorplanOptimizer):
             pins_pos, constraints, fp_sol, metrics,
         )
 
-        k  = s["block_count"]
-        tf = s["token_features"].unsqueeze(0).to(self._device)  # [1, k, 18]
-        wi = s["w_int"].unsqueeze(0).to(self._device)            # [1, k, k]
-
-        with torch.no_grad():
-            pred_norm = self._model(tf, wi, teacher_forcing=False)  # [1, k, 4]
-
-        # De-normalise to raw pixel scale
-        pred_sorted = pred_norm[0].cpu() * s["canvas_ref"]          # [k, 4]
+        # AR inference — soft-block hint zeroing handled inside ar_inference()
+        _, pred_sorted = ar_inference(self._model, s, self._device)  # [k, 4]
 
         # Restore original block order using sort_inv:
         #   sort_inv[j] = sorted position of original block j
         #   pred_original[j] = pred_sorted[sort_inv[j]]
-        sort_inv     = s["sort_inv"]                                 # [k]
-        pred_original = pred_sorted[sort_inv]                        # [k, 4]
+        k             = s["block_count"]
+        sort_inv      = s["sort_inv"]                                 # [k]
+        pred_original = pred_sorted[sort_inv]                         # [k, 4]
 
         return [
             (
@@ -446,6 +456,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--val-case", type=int, default=21,
                         help="Block count of the validation case to visualise (default: 21)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Checkpoint filename or path to load "
+                             "(default: best.pt → latest.pt in checkpoints/)")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -465,9 +478,37 @@ if __name__ == "__main__":
     block_count = int((area_target != -1).sum().item())
     print(f"\nValidation case (block_count={args.val_case}, idx={test_idx}): actual block_count={block_count}")
 
-    optimizer = MyOptimizer(verbose=True)
+    # Build fp_sol with w/h/x/y for fixed and preplaced blocks only.
+    # Soft blocks remain zero — the model predicts their placement freely.
+    n_padded = area_target.shape[0]
+    fp_sol_gt = torch.zeros(n_padded, 4)
+    is_fixed     = constraints[:block_count, 0]   # [k]
+    is_preplaced = constraints[:block_count, 1]   # [k]
+    for i in range(block_count):
+        if is_fixed[i].item() == 0 and is_preplaced[i].item() == 0:
+            continue   # soft block: leave zeros
+        verts = polygons[i]
+        v = verts if isinstance(verts, torch.Tensor) else torch.tensor(verts)
+        v = v[v[:, 0] != -1]
+        if v.numel() == 0:
+            continue
+        xy_min = v.min(0).values
+        xy_max = v.max(0).values
+        fp_sol_gt[i] = torch.tensor([
+            (xy_max[0] - xy_min[0]).item(),   # w
+            (xy_max[1] - xy_min[1]).item(),   # h
+            xy_min[0].item(),                  # x  (only used for preplaced)
+            xy_min[1].item(),                  # y  (only used for preplaced)
+        ])
+
+    n_fixed     = int(is_fixed.sum().item())
+    n_preplaced = int(is_preplaced.sum().item())
+    print(f"  fixed={n_fixed}  preplaced={n_preplaced}  soft={block_count - n_fixed - n_preplaced}")
+
+    optimizer = MyOptimizer(verbose=True, checkpoint=args.checkpoint)
     positions = optimizer.solve(
-        block_count, area_target, b2b_conn, p2b_conn, pins_pos, constraints
+        block_count, area_target, b2b_conn, p2b_conn, pins_pos, constraints,
+        fp_sol=fp_sol_gt,
     )
 
     print(f"\nReturn length : {len(positions)}  (expected {block_count})")
@@ -489,7 +530,6 @@ if __name__ == "__main__":
 
     # ── Compute losses for predicted positions ────────────────────────────
     from data.floorset_loader import preprocess_sample, build_w_int_unnorm
-    from loss.coord_loss      import coord_loss
     from loss.wirelength_loss import wirelength_loss
     from loss.area_loss       import area_loss
     from loss.violation_loss  import violation_loss
@@ -538,32 +578,23 @@ if __name__ == "__main__":
     abase  = torch.tensor([s["area_baseline"]], device=device)
     wiu    = build_w_int_unnorm(b2b_conn, k, s["sort_idx"]).unsqueeze(0).to(device)
 
-    # Run TF forward to obtain logits for coord_loss
-    tf_t_  = s["token_features"][:k].unsqueeze(0).to(device)   # [1, k, 18]
-    wi_t_  = s["w_int"][:k, :k].unsqueeze(0).to(device)         # [1, k, k]
-    kpm_   = torch.zeros(1, k, dtype=torch.bool, device=device) # no padding
-
     with torch.no_grad():
-        _, logits_tf = optimizer._model(tf_t_, wi_t_, gt_positions=gtn,
-                                        teacher_forcing=True)    # [1, k, G*G]
-        l_coord = coord_loss(logits_tf, gtn, cons, kpm_).item()
-        l_wl    = wirelength_loss(pred_raw, wiu, pins_t, p2b_t, hbase).item()
-        l_area  = area_loss(pred_raw, abase).item()
-        l_viol  = violation_loss(pred_norm, cons).item()
-        l_total = (l_coord
-                   + LAMBDA_WIRELENGTH * l_wl
+        l_wl   = wirelength_loss(pred_raw, wiu, pins_t, p2b_t, hbase).item()
+        l_area = area_loss(pred_raw, abase).item()
+        l_viol = violation_loss(pred_norm, cons).item()
+        l_total = (LAMBDA_WIRELENGTH * l_wl
                    + LAMBDA_AREA       * l_area
                    + LAMBDA_VIOLATION  * l_viol)
 
     print("\n" + "=" * 50)
     print("Loss Summary")
     print("=" * 50)
-    print(f"  coord      (×1.0) : {l_coord:.6f}")
+    print(f"  coord      (×1.0) : unknown (AR mode has no logits)")
     print(f"  wirelength (×{LAMBDA_WIRELENGTH})  : {l_wl:.6f}")
     print(f"  area       (×{LAMBDA_AREA})  : {l_area:.6f}")
     print(f"  violation  (×{LAMBDA_VIOLATION})  : {l_viol:.6f}")
     print("-" * 50)
-    print(f"  total              : {l_total:.6f}")
+    print(f"  total (excl. coord): {l_total:.6f}")
     print("=" * 50)
 
     # ── Visualize GT vs Predicted ─────────────────────────────────────────
@@ -589,7 +620,7 @@ if __name__ == "__main__":
 
     loss_parts = {
         "total":      l_total,
-        "coord":      l_coord,
+        "coord":      None,
         "wirelength": l_wl,
         "area":       l_area,
         "violation":  l_viol,

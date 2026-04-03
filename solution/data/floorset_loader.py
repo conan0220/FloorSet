@@ -45,6 +45,7 @@ from config import (
     PAD_VALUE,
     BOUNDARY_CODE_TO_IDX,
     BOUNDARY_DIM,
+    CLUSTER_DIM,
     RAW_FEATURE_DIM,
     CACHE_DIR,
     SHARD_SIZE,
@@ -142,7 +143,7 @@ def build_token_features(
     Build [k, RAW_FEATURE_DIM] token feature matrix in original block order.
     Caller should reorder with sort_idx afterwards.
 
-    Feature layout (18 dims):
+    Feature layout (21 dims):
       [0]      area_target            normalised by canvas_ref²
       [1]      is_soft
       [2]      is_fixed_shape
@@ -151,7 +152,7 @@ def build_token_features(
       [6-7]    target_x, target_y     normalised; 0 if not preplaced
       [8-15]   boundary_type          8-dim one-hot (all-zero = no constraint)
       [16]     is_mib
-      [17]     is_cluster
+      [17-20]  cluster_group          4-dim one-hot (group 1-4; all-zero = no cluster)
     """
     cons = constraints[:block_count].float()   # [k, 5]
     fp   = fp_sol[:block_count].float()        # [k, 4]  [w, h, x, y]
@@ -159,7 +160,7 @@ def build_token_features(
     is_fixed  = cons[:, 0]
     is_pre    = cons[:, 1]
     is_mib    = cons[:, 2]
-    is_clust  = cons[:, 3]
+    clust_ids = cons[:, 3].long()   # group IDs: 0=none, 1-4=groups
     bd_codes  = cons[:, 4].long()
 
     is_soft   = 1.0 - torch.clamp(is_fixed + is_pre, max=1.0)
@@ -177,15 +178,20 @@ def build_token_features(
 
     boundary_oh = _boundary_onehot(bd_codes)   # [k, 8]
 
+    # cluster group one-hot: group IDs 1-4 → dims 0-3; group 0 → all-zero
+    cluster_oh = torch.zeros(block_count, CLUSTER_DIM)
+    valid_mask = (clust_ids >= 1) & (clust_ids <= CLUSTER_DIM)
+    cluster_oh[valid_mask, clust_ids[valid_mask] - 1] = 1.0    # [k, 4]
+
     scalar_feats = torch.stack([
         norm_area, is_soft, is_fixed, is_pre,
         target_w, target_h, target_x, target_y,
     ], dim=1)                                                    # [k, 8]
 
     token = torch.cat(
-        [scalar_feats, boundary_oh, is_mib.unsqueeze(1), is_clust.unsqueeze(1)],
+        [scalar_feats, boundary_oh, is_mib.unsqueeze(1), cluster_oh],
         dim=1,
-    )                                                            # [k, 18]
+    )                                                            # [k, 21]
 
     assert token.shape[1] == RAW_FEATURE_DIM, (
         f"Expected RAW_FEATURE_DIM={RAW_FEATURE_DIM}, got {token.shape[1]}"

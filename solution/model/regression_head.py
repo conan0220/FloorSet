@@ -23,7 +23,7 @@ forward() modes
 ───────────────
 occupancy=None  (training / teacher-forcing):
     x:              [B, k, d_model]
-    token_features: [B, k, 18]
+    token_features: [B, k, 21]
     Returns: (pred_positions [B,k,4],  logits [B,k,G*G])
 
 occupancy=[B,G,G]  (autoregressive inference):
@@ -32,7 +32,7 @@ occupancy=[B,G,G]  (autoregressive inference):
     Returns: pred_positions [B,1,4]
     Side-effect: updates occupancy in-place with the newly placed block.
 
-Token feature layout (18 dims):
+Token feature layout (21 dims):
     [0]    area_target_norm
     [1]    is_soft
     [2]    is_fixed_shape
@@ -41,7 +41,7 @@ Token feature layout (18 dims):
     [6-7]  target_x, target_y (normalised)
     [8-15] boundary_type one-hot
     [16]   is_mib
-    [17]   is_cluster
+    [17-20] cluster_group one-hot (groups 1-4; all-zero = no cluster)
 """
 
 import math

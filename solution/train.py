@@ -50,6 +50,7 @@ from loss.wirelength_loss import wirelength_loss
 from loss.area_loss       import area_loss
 from loss.violation_loss  import violation_loss
 from viz_utils            import save_floorplan_viz
+from inference            import ar_inference
 
 
 # =============================================================================
@@ -370,18 +371,16 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
     pred_raw = pred_norm * ref   # [1, k, 4]
 
     with torch.no_grad():
-        l_coord = 0.0   # AR mode has no logits; coord_loss requires logits
-        l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
-        l_area  = area_loss(pred_raw, abase).item()
-        l_viol  = violation_loss(pred_norm, cons).item()
-        total   = (l_coord
-                   + LAMBDA_WIRELENGTH * l_wl
-                   + LAMBDA_AREA       * l_area
-                   + LAMBDA_VIOLATION  * l_viol)
+        l_wl   = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
+        l_area = area_loss(pred_raw, abase).item()
+        l_viol = violation_loss(pred_norm, cons).item()
+        total  = (LAMBDA_WIRELENGTH * l_wl
+                  + LAMBDA_AREA       * l_area
+                  + LAMBDA_VIOLATION  * l_viol)
 
     return {
         "total":      total,
-        "coord":      l_coord,
+        "coord":      None,   # AR mode has no logits
         "wirelength": l_wl,
         "area":       l_area,
         "violation":  l_viol,
@@ -390,18 +389,13 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
 
 def _infer_and_save(model, s: dict, epoch: int, device, source: str, label: str):
     """Run AR inference on one preprocessed sample dict, compute loss, save figure."""
-    k   = s["block_count"]
-    tf_ = s["token_features"][:k].unsqueeze(0).to(device)   # [1, k, 18]
-    wi_ = s["w_int"][:k, :k].unsqueeze(0).to(device)         # [1, k, k]
+    pred_norm, pred_raw = ar_inference(model, s, device)      # [1,k,4], [k,4]
+    gt_raw    = s["gt_positions_raw"][:s["block_count"]]      # [k, 4] sorted
 
-    pred_norm = model(tf_, wi_, teacher_forcing=False)        # [1, k, 4]
-    pred_raw  = (pred_norm[0] * s["canvas_ref"]).cpu()        # [k, 4]
-    gt_raw    = s["gt_positions_raw"][:k]                     # [k, 4] sorted
+    loss_parts  = _compute_viz_loss(s, pred_norm, device)
+    constraints = s["constraints_sorted"][:s["block_count"]].cpu()   # [k, 5]
 
-    loss_parts = _compute_viz_loss(s, pred_norm, device)
-    constraints = s["constraints_sorted"][:k].cpu()           # [k, 5]
-
-    _save_viz(gt_raw, pred_raw, epoch, k, source=source,
+    _save_viz(gt_raw, pred_raw, epoch, s["block_count"], source=source,
               label=label, loss_parts=loss_parts, constraints=constraints)
 
 

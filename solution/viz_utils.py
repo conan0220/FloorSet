@@ -97,9 +97,10 @@ def save_floorplan_viz(
         fig.suptitle(title)
 
     if loss_parts is not None:
+        coord_str = "unknown" if loss_parts['coord'] is None else f"{loss_parts['coord']:.4f}"
         loss_text = (
             f"total={loss_parts['total']:.4f}  "
-            f"coord={loss_parts['coord']:.4f}  "
+            f"coord={coord_str}  "
             f"wl={loss_parts['wirelength']:.4f}  "
             f"area={loss_parts['area']:.4f}  "
             f"viol={loss_parts['violation']:.4f}"

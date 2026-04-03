@@ -51,10 +51,13 @@ BOUNDARY_CODE_TO_IDX = {
 }
 BOUNDARY_DIM = 8  # one-hot dimensionality (0 → all-zero vector, no constraint)
 
+# Cluster group IDs in the dataset: 1, 2, 3, 4  (0 = no cluster)
+CLUSTER_DIM = 4   # one-hot dimensionality for cluster group
+
 # Raw token feature dimensionality before Linear projection:
 #   area_target(1) + block_type(3) + target_w/h(2) + target_x/y(2)
-#   + boundary_type(8) + is_mib(1) + is_cluster(1) = 18
-RAW_FEATURE_DIM = 18
+#   + boundary_type(8) + is_mib(1) + cluster_group_onehot(4) = 21
+RAW_FEATURE_DIM = 21
 
 # =============================================================================
 # Model Architecture

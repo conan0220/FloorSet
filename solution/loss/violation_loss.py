@@ -3,8 +3,9 @@ L_violation — soft constraint violation penalty.
 
 L_violation = V_grouping + V_mib + V_boundary + V_overlap
 
-  V_grouping : all is_cluster==1 blocks treated as one group;
-               penalty = sum of centroid distances to the group mean centroid.
+  V_grouping : blocks are grouped by cluster_group_id (1–4);
+               within each group, penalise centroid distances to that group's mean centroid;
+               groups are independent (group 1 blocks pull toward group-1 mean only).
 
   V_mib      : all is_mib==1 blocks treated as one group;
                penalty = sum of L2 distances from each block's (w, h) to
@@ -64,16 +65,24 @@ def violation_loss(
     bbox_ymax = y_top.max(dim=1).values             # [B]
 
     # ── Constraint masks ───────────────────────────────────────────
-    is_mib     = constraints[:, :, 2].float()       # [B, k]
-    is_cluster = constraints[:, :, 3].float()       # [B, k]
-    bcode      = constraints[:, :, 4].long()        # [B, k]  bitmask int
+    is_mib      = constraints[:, :, 2].float()      # [B, k]
+    clust_ids   = constraints[:, :, 3].long()       # [B, k]  group IDs 0–4
+    bcode       = constraints[:, :, 4].long()       # [B, k]  bitmask int
 
-    # ── V_grouping ─────────────────────────────────────────────────
-    n_clus   = is_cluster.sum(dim=1, keepdim=True).clamp(min=1)          # [B, 1]
-    mean_cx  = (cx * is_cluster).sum(dim=1, keepdim=True) / n_clus       # [B, 1]
-    mean_cy  = (cy * is_cluster).sum(dim=1, keepdim=True) / n_clus       # [B, 1]
-    dist_clus = ((cx - mean_cx).pow(2) + (cy - mean_cy).pow(2) + 1e-8).sqrt()
-    v_grouping = (dist_clus * is_cluster).sum()
+    # ── V_grouping (per-group centroid distance) ────────────────────
+    # For each cluster group g in {1,2,3,4}, compute the mean centroid of
+    # all blocks in that group, then penalise each block's distance to it.
+    v_grouping = pred.new_zeros(1).squeeze()
+    for g in range(1, 5):
+        mask = (clust_ids == g).float()             # [B, k]  1 if in group g
+        n_g  = mask.sum(dim=1, keepdim=True).clamp(min=1)   # [B, 1]
+        has_any = (mask.sum(dim=1) > 0)             # [B]  skip empty groups
+        if not has_any.any():
+            continue
+        mean_cx_g = (cx * mask).sum(dim=1, keepdim=True) / n_g   # [B, 1]
+        mean_cy_g = (cy * mask).sum(dim=1, keepdim=True) / n_g   # [B, 1]
+        dist_g = ((cx - mean_cx_g).pow(2) + (cy - mean_cy_g).pow(2) + 1e-8).sqrt()
+        v_grouping = v_grouping + (dist_g * mask).sum()
 
     # ── V_mib ──────────────────────────────────────────────────────
     pw    = pred[:, :, 2]                                                 # [B, k]

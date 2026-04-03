@@ -1,0 +1,148 @@
+================================================================================
+FloorSet 資料結構參考文件
+================================================================================
+
+一、訓練資料：floorset_lite/worker_N/layouts_X.th
+────────────────────────────────────────────────────────────────────────────────
+
+檔案為一個長度 7 的 list，第一維 = 該檔案內打包的 layout 數量（例如 112）。
+同一個 worker 檔案內所有 layout 的 block 數相同（無 padding）。
+
+┌───────┬──────────────────────┬────────────────────┬──────────────────────────────────────────────┐
+│ Index │ Shape                │ 名稱               │ 說明                                         │
+├───────┼──────────────────────┼────────────────────┼──────────────────────────────────────────────┤
+│  [0]  │ (N, n_blocks, 6)     │ block_features     │ 每個 block 的輸入特徵（見下方欄位明細）       │
+│  [1]  │ (N, n_b2b_edges, 3)  │ b2b_connectivity   │ Block-to-block 連接：[block_i, block_j, w]   │
+│  [2]  │ (N, n_p2b_edges, 3)  │ p2b_connectivity   │ Pin-to-block 連接：[pin_idx, block_idx, w]   │
+│  [3]  │ (N, n_pins, 2)       │ pins_pos           │ Pin 座標：[x, y]                             │
+│  [4]  │ (N, n_blocks-1, 3)   │ tree_sol           │ B*-tree 結構：[parent, child, direction(0/1)]│
+│  [5]  │ (N, n_blocks, 4)     │ fp_sol             │ 解答矩形：[w, h, x, y]，w×h = area_target   │
+│  [6]  │ (N, 8)               │ metrics            │ 統計指標（見下方欄位明細）                   │
+└───────┴──────────────────────┴────────────────────┴──────────────────────────────────────────────┘
+
+▸ block_features [0] 欄位明細：
+┌───────┬─────────────────────┬─────────────────────────────────────┐
+│ col   │ 名稱                │ 值域                                │
+├───────┼─────────────────────┼─────────────────────────────────────┤
+│  0    │ area_target         │ float, 0–850                        │
+│  1    │ is_fixed_shape      │ {0, 1}                              │
+│  2    │ is_preplaced        │ {0, 1}                              │
+│  3    │ is_mib              │ {0, 1}  (MIB = multi-instantiation) │
+│  4    │ cluster_group_id    │ {0,1,2,3,4}  (0 = 無 cluster)      │
+│  5    │ boundary_code       │ {0,1,2,4,5,6,8,9,10}  (bit flags)  │
+└───────┴─────────────────────┴─────────────────────────────────────┘
+
+▸ fp_sol [5] 欄位明細：
+┌───────┬──────┬───────────────────────────┐
+│ col   │ 名稱 │ 說明                      │
+├───────┼──────┼───────────────────────────┤
+│  0    │ w    │ 寬度，w × h = area_target │
+│  1    │ h    │ 高度                      │
+│  2    │ x    │ 左邊緣座標                │
+│  3    │ y    │ 下邊緣座標                │
+└───────┴──────┴───────────────────────────┘
+
+▸ metrics [6] 欄位明細：
+┌───────┬────────────────────────┬────────────────────┐
+│ col   │ 名稱                   │ 備註               │
+├───────┼────────────────────────┼────────────────────┤
+│  0    │ total_area             │ 所有 block 面積總和 │
+│  1    │ num_pins               │ pin 總數            │
+│  2    │ num_total_nets         │ net 總數            │
+│  3    │ num_b2b_edges          │ b2b 連接邊數        │
+│  4    │ num_p2b_edges          │ p2b 連接邊數        │
+│  5    │ num_hard_constraints   │ hard constraint 數  │
+│  6    │ b2b_weighted_wl        │ b2b 加權線長        │
+│  7    │ p2b_weighted_wl        │ p2b 加權線長        │
+└───────┴────────────────────────┴────────────────────┘
+
+▸ tree_sol [4] 說明：
+  - 74 筆 = n_blocks - 1 條邊，代表 B*-tree 的親子關係
+  - col 0: parent block index
+  - col 1: child block index
+  - col 2: direction  0 = left child（放在 parent 右側）
+                      1 = right child（放在 parent 上方）
+
+
+二、測試輸入資料：LiteTensorDataTest/config_N/litedata_X.pth
+────────────────────────────────────────────────────────────────────────────────
+
+檔案為一個長度 1 的 list（每檔一個 layout）。
+layout[0] 包含一個長度 4 的 list：
+
+┌───────┬─────────────────────┬────────────────────┬────────────────────────────────────────────────┐
+│ Index │ Shape               │ 名稱               │ 說明                                           │
+├───────┼─────────────────────┼────────────────────┼────────────────────────────────────────────────┤
+│  [0]  │ (n_blocks, 6)       │ block_features     │ 同訓練資料 [0]，欄位相同                       │
+│  [1]  │ (n_b2b_edges, 3)    │ b2b_connectivity   │ [block_i, block_j, weight]                     │
+│  [2]  │ (n_p2b_edges, 3)    │ p2b_connectivity   │ [pin_idx, block_idx, weight]                   │
+│  [3]  │ (n_pins, 2)         │ pins_pos           │ [x, y]                                         │
+└───────┴─────────────────────┴────────────────────┴────────────────────────────────────────────────┘
+
+  注意：litedata 中「無」fp_sol（無 target w/h/x/y）、無 tree_sol、無 metrics。
+  Dataset loader 中拆解方式：
+    area_target          = block_features[:, 0]       → shape (n_blocks,)
+    placement_constraints = block_features[:, 1:]     → shape (n_blocks, 5)
+
+
+三、測試標籤資料：LiteTensorDataTest/config_N/litelabel_X.pth
+────────────────────────────────────────────────────────────────────────────────
+
+檔案為一個長度 1 的 list。
+label[0] 包含一個長度 2 的 list：
+
+┌───────┬─────────────────────┬────────────────────┬────────────────────────────────────────────────┐
+│ Index │ Shape               │ 名稱               │ 說明                                           │
+├───────┼─────────────────────┼────────────────────┼────────────────────────────────────────────────┤
+│  [0]  │ (8,)                │ metrics            │ 同訓練資料 metrics，欄位相同                   │
+│  [1]  │ (n_blocks, 5, 2)    │ fp_sol (polygons)  │ 每個 block 的多邊形頂點座標，5 個頂點 [x,y]   │
+└───────┴─────────────────────┴────────────────────┴────────────────────────────────────────────────┘
+
+  注意：polygon 格式是閉合多邊形（第 0 點 = 第 4 點）。
+  從 polygon 還原 bounding box：
+    xy_min = vertices.min(0)  → (x, y)
+    xy_max = vertices.max(0)
+    w = xy_max[0] - xy_min[0]
+    h = xy_max[1] - xy_min[1]
+
+
+四、格式差異對照表
+────────────────────────────────────────────────────────────────────────────────
+
+┌────────────────────────────┬──────────────────────────┬──────────────────────────┐
+│ 欄位                       │ 訓練 layouts_X.th        │ 測試 litedata/litelabel  │
+├────────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ block features             │ [0] shape (N, n, 6)      │ litedata[0] shape (n, 6) │
+│ b2b_connectivity           │ [1]                      │ litedata[1]              │
+│ p2b_connectivity           │ [2]                      │ litedata[2]              │
+│ pins_pos                   │ [3]                      │ litedata[3]              │
+│ tree_sol (B*-tree)         │ [4] shape (N, n-1, 3)    │ 無                       │
+│ fp_sol 格式                │ [5] [w, h, x, y] 矩形   │ litelabel[1] polygon頂點 │
+│ metrics                    │ [6] shape (N, 8)         │ litelabel[0] shape (8,)  │
+│ 單檔 layout 數             │ 多個 (例如 112)          │ 1 個                     │
+│ padding                    │ 無（同 worker 同 n）     │ 有（-1 填充）            │
+└────────────────────────────┴──────────────────────────┴──────────────────────────┘
+
+
+五、Contest API solve() 可取得的資訊
+────────────────────────────────────────────────────────────────────────────────
+
+  solve(block_count, area_targets, b2b_connectivity, p2b_connectivity, pins_pos, constraints)
+
+┌────────────────────────┬───────────────────┬──────────────────────────────────────────────┐
+│ 參數                   │ Shape             │ 說明                                         │
+├────────────────────────┼───────────────────┼──────────────────────────────────────────────┤
+│ block_count            │ int               │ 有效 block 數（去除 padding）                │
+│ area_targets           │ (n_padded,)       │ 各 block 面積目標（padding = -1）            │
+│ b2b_connectivity       │ (n_edges, 3)      │ [block_i, block_j, weight]                   │
+│ p2b_connectivity       │ (n_edges, 3)      │ [pin_idx, block_idx, weight]                 │
+│ pins_pos               │ (n_pins, 2)       │ [x, y]                                       │
+│ constraints            │ (n_padded, 5)     │ [is_fixed, is_preplaced, is_mib,             │
+│                        │                   │  cluster_group_id, boundary_code]            │
+└────────────────────────┴───────────────────┴──────────────────────────────────────────────┘
+
+  ！重要：solve() 不提供 fixed/preplaced block 的 target w/h/x/y。
+          評分者持有 litelabel 用來核對，但不傳給 solver。
+          模型必須從訓練資料學會如何處理這些 constraint flag。
+
+================================================================================

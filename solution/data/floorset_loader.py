@@ -544,6 +544,10 @@ class CachedShardIterableDataset(IterableDataset):
                 yield from shard
 
 
+def _identity_collate(batch):
+    return batch   # list[dict], handed to collate_samples()
+
+
 def get_cached_training_dataloader(
     cache_dir:   Path      = CACHE_DIR,
     batch_size:  int       = 1,
@@ -571,9 +575,6 @@ def get_cached_training_dataloader(
         cache_dir=cache_dir, shuffle=shuffle, seed=seed,
         preload=preload, num_shards=num_shards,
     )
-
-    def _identity_collate(batch):
-        return batch   # list[dict], handed to collate_samples()
 
     return DataLoader(
         dataset,

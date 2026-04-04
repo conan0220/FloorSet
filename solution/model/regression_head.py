@@ -136,6 +136,11 @@ class DiscreteRegressionHead(nn.Module):
         self.ratio_head = nn.Linear(hidden + 2, 1)  # +2: conditioning on predicted (x, y)
         self._fallback_count = 0   # reset by TransformerFloorplan before each AR pass
 
+        # Initialise ratio_head near-zero so ratio_raw ≈ 0 → ratio ≈ 1 → blocks start square.
+        # Without this, kaiming init can push ratio_raw far negative → degenerate thin strips.
+        nn.init.xavier_uniform_(self.ratio_head.weight, gain=0.01)
+        nn.init.zeros_(self.ratio_head.bias)
+
         # Pre-computed grid cell coordinates for soft-argmax (training mode).
         # cell_gx[i] = (i % G) / G  → normalised x of cell i
         # cell_gy[i] = (i // G) / G → normalised y of cell i

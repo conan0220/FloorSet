@@ -82,25 +82,26 @@ WARMUP_STEPS   = 4000       # linear warmup before cosine decay
 GRAD_CLIP_NORM = 1.0
 
 # Loss weights
-LAMBDA_COORD      = 0.1     # weight for L_coord     (grid cross-entropy; soft-argmax gives xy_head physical gradients)
 LAMBDA_WIRELENGTH = 0.3     # weight for L_wirelength
 LAMBDA_AREA       = 0.3     # weight for L_area
-LAMBDA_RATIO      = 0.1     # weight for L_ratio     (aspect ratio supervision, reduced from 0.5)
 LAMBDA_GROUPING   = 0.1     # weight for V_grouping  (cluster centroid distance)
 LAMBDA_MIB        = 0.1     # weight for V_mib       (macro-in-block size deviation)
 LAMBDA_BOUNDARY   = 0.1     # weight for V_boundary  (boundary gap penalty)
 LAMBDA_OVERLAP    = 50.0    # weight for V_overlap   (pairwise overlap area)
 
+# Ratio regularisation: penalise log(w/h)² to prevent degenerate thin-strip blocks.
+# Weight decays linearly from LAMBDA_RATIO_REG → 0 over RATIO_REG_DECAY_EPOCHS epochs,
+# then stays at 0 so physical losses fully take over.
+LAMBDA_RATIO_REG        = 2.0   # initial weight (epoch 0)
+RATIO_REG_DECAY_EPOCHS  = 20    # number of epochs to reach 0
 
-# Extra weight on preplaced blocks in L_coord
-PREPLACED_COORD_WEIGHT = 5.0
 
 # =============================================================================
 # Evaluation / Validation
 # =============================================================================
 
 # Validate every N epochs (runs official evaluator)
-VALIDATE_EVERY = 5
+VALIDATE_EVERY = 50
 
 # Block sizes selected for visualization (one per 10 sizes from 21 to 111)
 VIZ_BLOCK_SIZES = [21, 31, 41, 51, 61, 71, 81, 91, 101, 111]

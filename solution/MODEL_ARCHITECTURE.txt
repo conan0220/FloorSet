@@ -1,0 +1,157 @@
+================================================================================
+Floorplan Transformer — Model Architecture
+================================================================================
+
+Config (solution/config.py)
+────────────────────────────
+  D_MODEL            = 256
+  NUM_HEADS          = 8
+  NUM_ENCODER_LAYERS = 6
+  NUM_DECODER_LAYERS = 6
+  DIM_FEEDFORWARD    = 1024
+  DROPOUT            = 0.1
+  GRID_SIZE          = 64    (G×G = 4096 grid cells)
+  RAW_FEATURE_DIM    = 21
+  MAX_BLOCKS         = 120
+
+================================================================================
+Input Token Features  [B, k, 21]
+================================================================================
+
+  [0]      area_target          normalised by canvas_ref²
+  [1]      is_soft
+  [2]      is_fixed_shape
+  [3]      is_preplaced
+  [4-5]    target_w, target_h   normalised; 0 if not fixed/preplaced
+  [6-7]    target_x, target_y   normalised; 0 if not preplaced
+  [8-15]   boundary_type        8-dim one-hot (all-zero = no constraint)
+  [16]     is_mib
+  [17-20]  cluster_group        4-dim one-hot (groups 1–4; all-zero = none)
+
+================================================================================
+Layer 1 — TokenFeatureProjection                              6,144 params
+================================================================================
+
+  [B, k, 21]
+    → Linear(21, 256)
+    → LayerNorm(256)
+    → Dropout(0.1)
+  → [B, k, 256]
+
+  Purpose: project raw block features to d_model-dim token embeddings.
+
+================================================================================
+Layer 2 — FloorplanEncoder  (6 layers)                    4,738,566 params
+================================================================================
+
+  [B, k, 256]
+    → 6 × NetlistEncoderLayer
+         ├─ NetlistBiasAttention
+         │    scores = QKᵀ/√d_h  +  α·w_int
+         │    α: per-layer learnable scalar
+         │    w_int [B, k, k]: normalised b2b connectivity matrix
+         │    → Multi-head self-attention (8 heads)
+         │    → Dropout → Add & LayerNorm
+         └─ FFN
+              Linear(256 → 1024) → ReLU → Dropout → Linear(1024 → 256)
+              → Dropout → Add & LayerNorm
+  → [B, k, 256]
+
+  Purpose: build contextual embeddings that encode netlist topology.
+           Blocks with high connectivity attend to each other more strongly.
+
+================================================================================
+Layer 3 — FloorplanDecoder  (6 layers)                    6,352,896 params
+================================================================================
+
+  Inputs:
+    encoder_output  [B, k, 256]
+    positions       [B, k, 4]   GT (training) or previous predictions (inference)
+
+  Decoder token at step t:
+    t == 0  →  SOS token (learnable nn.Parameter [1, 1, 256])
+    t  > 0  →  coord_proj(position[t-1]) + block_id_embed(t-1)
+
+  [B, k, 256]
+    → 6 × TransformerDecoderLayer
+         ├─ Masked Self-attention   (causal mask — step t only sees 0..t-1)
+         │    → Dropout → Add & LayerNorm
+         ├─ Cross-attention         (attend to encoder_output)
+         │    → Dropout → Add & LayerNorm
+         └─ FFN
+              Linear(256 → 1024) → ReLU → Dropout → Linear(1024 → 256)
+              → Dropout → Add & LayerNorm
+  → [B, k, 256]
+
+  Training mode (teacher_forcing=True):
+    All k steps computed in parallel using causal mask.
+
+  Inference mode (teacher_forcing=False):
+    k sequential steps; each step's prediction fed as next input.
+
+================================================================================
+Layer 4 — DiscreteRegressionHead                            282,755 params
+================================================================================
+
+  [B, k, 256]
+    → shared: Linear(256 → 64) → ReLU          → [B, k, 64]
+    │
+    ├─ xy_head: Linear(64 → G²=4096)            → logits [B, k, 4096]
+    │    Training:  soft-argmax over logits
+    │                 x = Σ(softmax(logits) · cell_gx)
+    │                 y = Σ(softmax(logits) · cell_gy)
+    │    Inference: argmax + occupancy mask + exact overlap retry (max 10)
+    │
+    └─ ratio_head: Linear(64+2 → 1)             conditioned on (x, y)
+         ratio_raw → ratio = exp(ratio_raw)
+         pred_w = √(area_norm · ratio)
+         pred_h = √(area_norm / ratio)
+
+  Overrides (fixed/preplaced blocks):
+    is_fixed_shape or is_preplaced  →  w, h from token_features[4,5]
+    is_preplaced                    →  x, y from token_features[6,7]
+
+  Output: [B, k, 4]  (x, y, w, h), normalised by canvas_ref
+
+================================================================================
+Parameter Summary
+================================================================================
+
+  token_proj  :      6,144
+  encoder     :  4,738,566
+  decoder     :  6,352,896
+  head        :    282,755
+  ─────────────────────────
+  TOTAL       : 11,380,361  (~11.4M)
+
+================================================================================
+Data Flow Summary
+================================================================================
+
+  token_features [B,k,21]
+       │
+       ▼  TokenFeatureProjection
+  [B, k, 256]
+       │
+       ▼  FloorplanEncoder (netlist bias attention × 6)
+  [B, k, 256]   ← each block embedding is aware of the full netlist topology
+       │
+       ▼  FloorplanDecoder (masked self-attn + cross-attn × 6)
+  [B, k, 256]   ← each step is aware of previously placed blocks
+       │
+       ▼  DiscreteRegressionHead
+  [B, k, 4]    (x, y, w, h) normalised
+
+================================================================================
+Loss Functions  (solution/loss/)
+================================================================================
+
+  wirelength_loss   LAMBDA = 0.3    HPWL gap vs SA baseline (b2b + p2b)
+  area_loss         LAMBDA = 0.3    bounding-box area gap vs SA baseline
+  violation_loss:
+    v_grouping      LAMBDA = 0.1    cluster centroid distance
+    v_mib           LAMBDA = 0.1    MIB block size deviation
+    v_boundary      LAMBDA = 0.1    boundary constraint gap penalty
+    v_overlap       LAMBDA = 50.0   pairwise overlap area / n_blocks
+  ratio_reg         LAMBDA = 2.0→0  log(w/h)² penalty, decays to 0 at epoch 20
+                                    (prevents degenerate thin-strip blocks)

@@ -456,6 +456,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--val-case", type=int, default=21,
                         help="Block count of the validation case to visualise (default: 21)")
+    parser.add_argument("--train-idx", type=int, default=None,
+                        help="0-based index into the training dataset "
+                             "(uses training data instead of validation data)")
+    parser.add_argument("--shard-idx", type=int, default=None,
+                        help="0-based index within shard_000000.pt of the cache "
+                             "(uses cached training data; fastest option)")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Checkpoint filename or path to load "
                              "(default: best.pt → latest.pt in checkpoints/)")
@@ -465,41 +471,118 @@ if __name__ == "__main__":
     print("my_optimizer.py  —  smoke test")
     print("=" * 60)
 
-    sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
-    from lite_dataset_test import FloorplanDatasetLiteTest
+    fp_sol_from_train = None   # set only when using training data
 
-    dataset  = FloorplanDatasetLiteTest(str(_REPO_ROOT) + "/")
-    test_idx = args.val_case - 21
-    sample   = dataset[test_idx]
-    inputs, labels = sample["input"], sample["label"]
-    area_target, b2b_conn, p2b_conn, pins_pos, constraints = inputs
-    polygons, val_metrics = labels
+    if args.shard_idx is not None:
+        # ── Load from cache shard ─────────────────────────────────────────
+        sys.path.insert(0, str(_REPO_ROOT / "solution"))
+        from pathlib import Path as _Path
+        from config import CACHE_DIR, MAX_BLOCKS
+        from config import PAD_VALUE as _PAD
 
-    block_count = int((area_target != -1).sum().item())
-    print(f"\nValidation case (block_count={args.val_case}, idx={test_idx}): actual block_count={block_count}")
+        shard_path = sorted(_Path(CACHE_DIR).glob("shard_*.pt"))[0]
+        print(f"Loading shard: {shard_path.name}")
+        shard = torch.load(shard_path, weights_only=False)
+        assert args.shard_idx < len(shard), \
+            f"--shard-idx {args.shard_idx} out of range (shard has {len(shard)} samples)"
+        s = shard[args.shard_idx]
+
+        k          = s["block_count"]
+        canvas_ref = s["canvas_ref"]
+        sort_idx_s = s["sort_idx"]              # [k]  sorted→original
+        token_features     = s["token_features"]        # [k, 21] sorted
+        constraints_sorted = s["constraints_sorted"]    # [k, 5]
+        gt_raw     = s["gt_positions_raw"]      # [k, 4] (x,y,w,h) sorted
+        b2b_sorted = s["b2b_conn"]              # [e, 3] sorted block indices
+        p2b_sorted = s["p2b_conn"]              # [e, 3] sorted block index in col 1
+
+        # area_target [MAX_BLOCKS]: un-sort token_features[:, 0] * canvas_ref²
+        area_target = torch.full((MAX_BLOCKS,), _PAD)
+        area_target[sort_idx_s] = token_features[:, 0] * (canvas_ref ** 2)
+
+        # b2b_conn: remap sorted block indices → original
+        b2b_conn = b2b_sorted.clone().float()
+        if b2b_conn.numel() > 0:
+            b2b_conn[:, 0] = sort_idx_s[b2b_sorted[:, 0].long()].float()
+            b2b_conn[:, 1] = sort_idx_s[b2b_sorted[:, 1].long()].float()
+
+        # p2b_conn: remap block column (1) only
+        p2b_conn = p2b_sorted.clone().float()
+        if p2b_conn.numel() > 0:
+            p2b_conn[:, 1] = sort_idx_s[p2b_sorted[:, 1].long()].float()
+
+        # constraints [MAX_BLOCKS, 5]: un-sort
+        constraints = torch.zeros(MAX_BLOCKS, 5)
+        constraints[sort_idx_s] = constraints_sorted.float()
+
+        # fp_sol_from_train [MAX_BLOCKS, 4] in [w,h,x,y]: un-sort from gt_raw [x,y,w,h]
+        fp_sol_from_train = torch.zeros(MAX_BLOCKS, 4)
+        fp_sol_from_train[sort_idx_s] = gt_raw[:, [2, 3, 0, 1]]   # [w,h,x,y]
+
+        pins_pos    = s["pins_pos"]             # [p, 2] already valid (no padding)
+        val_metrics = s["metrics"]
+        polygons    = None
+        block_count = k
+        print(f"\nCache shard idx={args.shard_idx}: block_count={block_count}")
+
+    elif args.train_idx is not None:
+        sys.path.insert(0, str(_REPO_ROOT / "solution"))
+        from data.floorset_loader import get_training_dataloader
+        loader = get_training_dataloader(
+            batch_size=1, num_samples=args.train_idx + 1, shuffle=False,
+        )
+        batch = None
+        for _i, _b in enumerate(loader):
+            if _i == args.train_idx:
+                batch = _b
+                break
+        assert batch is not None, f"--train-idx {args.train_idx} is out of range"
+        (area_target, b2b_conn, p2b_conn, pins_pos, constraints,
+         _tree_sol, fp_sol_from_train, val_metrics) = [x.squeeze(0) for x in batch]
+        polygons = None
+        block_count = int((area_target != -1).sum().item())
+        print(f"\nTraining sample idx={args.train_idx}: block_count={block_count}")
+    else:
+        sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
+        from lite_dataset_test import FloorplanDatasetLiteTest
+        dataset  = FloorplanDatasetLiteTest(str(_REPO_ROOT) + "/")
+        test_idx = args.val_case - 21
+        sample   = dataset[test_idx]
+        inputs, labels = sample["input"], sample["label"]
+        area_target, b2b_conn, p2b_conn, pins_pos, constraints = inputs
+        polygons, val_metrics = labels
+        block_count = int((area_target != -1).sum().item())
+        print(f"\nValidation case (block_count={args.val_case}, idx={test_idx}): actual block_count={block_count}")
 
     # Build fp_sol with w/h/x/y for fixed and preplaced blocks only.
     # Soft blocks remain zero — the model predicts their placement freely.
     n_padded = area_target.shape[0]
-    fp_sol_gt = torch.zeros(n_padded, 4)
     is_fixed     = constraints[:block_count, 0]   # [k]
     is_preplaced = constraints[:block_count, 1]   # [k]
-    for i in range(block_count):
-        if is_fixed[i].item() == 0 and is_preplaced[i].item() == 0:
-            continue   # soft block: leave zeros
-        verts = polygons[i]
-        v = verts if isinstance(verts, torch.Tensor) else torch.tensor(verts)
-        v = v[v[:, 0] != -1]
-        if v.numel() == 0:
-            continue
-        xy_min = v.min(0).values
-        xy_max = v.max(0).values
-        fp_sol_gt[i] = torch.tensor([
-            (xy_max[0] - xy_min[0]).item(),   # w
-            (xy_max[1] - xy_min[1]).item(),   # h
-            xy_min[0].item(),                  # x  (only used for preplaced)
-            xy_min[1].item(),                  # y  (only used for preplaced)
-        ])
+    if fp_sol_from_train is not None:
+        # Training data: fp_sol already available; zero out soft blocks
+        fp_sol_gt = fp_sol_from_train.clone()
+        for i in range(block_count):
+            if is_fixed[i].item() == 0 and is_preplaced[i].item() == 0:
+                fp_sol_gt[i] = 0.0
+    else:
+        fp_sol_gt = torch.zeros(n_padded, 4)
+        for i in range(block_count):
+            if is_fixed[i].item() == 0 and is_preplaced[i].item() == 0:
+                continue   # soft block: leave zeros
+            verts = polygons[i]
+            v = verts if isinstance(verts, torch.Tensor) else torch.tensor(verts)
+            v = v[v[:, 0] != -1]
+            if v.numel() == 0:
+                continue
+            xy_min = v.min(0).values
+            xy_max = v.max(0).values
+            fp_sol_gt[i] = torch.tensor([
+                (xy_max[0] - xy_min[0]).item(),   # w
+                (xy_max[1] - xy_min[1]).item(),   # h
+                xy_min[0].item(),                  # x  (only used for preplaced)
+                xy_min[1].item(),                  # y  (only used for preplaced)
+            ])
 
     n_fixed     = int(is_fixed.sum().item())
     n_preplaced = int(is_preplaced.sum().item())
@@ -532,30 +615,32 @@ if __name__ == "__main__":
     from data.floorset_loader import preprocess_sample, build_w_int_unnorm
     from loss.wirelength_loss import wirelength_loss
     from loss.area_loss       import area_loss
-    from loss.ratio_loss      import ratio_loss
     from loss.violation_loss  import violation_loss
     from config import (
-        LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_RATIO,
+        LAMBDA_WIRELENGTH, LAMBDA_AREA,
         LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
     )
 
     n_padded = area_target.shape[0]
 
-    # Build fp_sol from GT polygons ([w, h, x, y] format expected by preprocess_sample)
-    fp_sol = torch.zeros(n_padded, 4)
-    for i in range(block_count):
-        verts = polygons[i]
-        v = verts if isinstance(verts, torch.Tensor) else torch.tensor(verts)
-        v = v[v[:, 0] != -1]
-        if v.numel() > 0:
-            xy_min = v.min(0).values
-            xy_max = v.max(0).values
-            fp_sol[i] = torch.tensor([
-                (xy_max[0] - xy_min[0]).item(),  # w
-                (xy_max[1] - xy_min[1]).item(),  # h
-                xy_min[0].item(),                 # x
-                xy_min[1].item(),                 # y
-            ])
+    # Build fp_sol ([w, h, x, y] format expected by preprocess_sample)
+    if fp_sol_from_train is not None:
+        fp_sol = fp_sol_from_train
+    else:
+        fp_sol = torch.zeros(n_padded, 4)
+        for i in range(block_count):
+            verts = polygons[i]
+            v = verts if isinstance(verts, torch.Tensor) else torch.tensor(verts)
+            v = v[v[:, 0] != -1]
+            if v.numel() > 0:
+                xy_min = v.min(0).values
+                xy_max = v.max(0).values
+                fp_sol[i] = torch.tensor([
+                    (xy_max[0] - xy_min[0]).item(),  # w
+                    (xy_max[1] - xy_min[1]).item(),  # h
+                    xy_min[0].item(),                 # x
+                    xy_min[1].item(),                 # y
+                ])
 
     s = preprocess_sample(
         area_target, b2b_conn, p2b_conn,
@@ -566,13 +651,12 @@ if __name__ == "__main__":
     ref    = s["canvas_ref"]
 
     pred_t = torch.tensor(positions, dtype=torch.float32)           # [k, 4]  original order
-    # Re-sort to sorted block order so pred aligns with gtn / cons / wiu
+    # Re-sort to sorted block order so pred aligns with cons / wiu
     sort_idx   = s["sort_idx"]                                       # [k]
     pred_sorted = pred_t[sort_idx]                                   # [k, 4]  sorted order
     pred_norm = (pred_sorted / ref).unsqueeze(0).to(device)          # [1, k, 4]
     pred_raw  = pred_sorted.unsqueeze(0).to(device)                  # [1, k, 4]
 
-    gtn   = s["gt_positions_norm"][:k].unsqueeze(0).to(device)
     cons  = s["constraints_sorted"][:k].unsqueeze(0).to(device)
     p2b_t = s["p2b_conn"].unsqueeze(0).to(device)
     pins_t = s["pins_pos"].unsqueeze(0).to(device)
@@ -580,12 +664,9 @@ if __name__ == "__main__":
     abase  = torch.tensor([s["area_baseline"]], device=device)
     wiu    = build_w_int_unnorm(b2b_conn, k, s["sort_idx"]).unsqueeze(0).to(device)
 
-    kpm_inf = torch.zeros(1, k, dtype=torch.bool, device=device)
-
     with torch.no_grad():
         l_wl    = wirelength_loss(pred_raw, wiu, pins_t, p2b_t, hbase).item()
         l_area  = area_loss(pred_raw, abase).item()
-        l_ratio = ratio_loss(pred_norm, gtn, cons, kpm_inf).item()
         l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
         l_grouping = l_grouping.item()
         l_mib      = l_mib.item()
@@ -593,7 +674,6 @@ if __name__ == "__main__":
         l_overlap  = l_overlap.item()
         l_total = (LAMBDA_WIRELENGTH * l_wl
                    + LAMBDA_AREA     * l_area
-                   + LAMBDA_RATIO    * l_ratio
                    + LAMBDA_GROUPING * l_grouping
                    + LAMBDA_MIB      * l_mib
                    + LAMBDA_BOUNDARY * l_boundary
@@ -602,54 +682,67 @@ if __name__ == "__main__":
     print("\n" + "=" * 50)
     print("Loss Summary")
     print("=" * 50)
-    print(f"  coord      (×1.0)              : unknown (AR mode has no logits)")
     print(f"  wirelength (×{LAMBDA_WIRELENGTH})           : {l_wl:.6f}")
     print(f"  area       (×{LAMBDA_AREA})           : {l_area:.6f}")
-    print(f"  ratio      (×{LAMBDA_RATIO})           : {l_ratio:.6f}")
     print(f"  grouping   (×{LAMBDA_GROUPING})           : {l_grouping:.6f}")
     print(f"  mib        (×{LAMBDA_MIB})           : {l_mib:.6f}")
     print(f"  boundary   (×{LAMBDA_BOUNDARY})           : {l_boundary:.6f}")
     print(f"  overlap    (×{LAMBDA_OVERLAP})           : {l_overlap:.6f}")
     print("-" * 50)
-    print(f"  total (excl. coord): {l_total:.6f}")
+    print(f"  total: {l_total:.6f}")
     print("=" * 50)
 
     # ── Visualize GT vs Predicted ─────────────────────────────────────────
-    # Parse GT positions from polygons
-    gt_positions = []
-    for i in range(block_count):
-        verts = polygons[i]
-        if isinstance(verts, torch.Tensor):
-            valid = verts[verts[:, 0] != -1]
-        else:
-            valid = torch.tensor(verts)
-            valid = valid[valid[:, 0] != -1]
-        if valid.numel() > 0:
-            xy_min = valid.min(0).values
-            xy_max = valid.max(0).values
-            gt_positions.append((
-                xy_min[0].item(), xy_min[1].item(),
-                (xy_max[0] - xy_min[0]).item(),
-                (xy_max[1] - xy_min[1]).item(),
-            ))
-        else:
-            gt_positions.append((0.0, 0.0, 0.0, 0.0))
+    # Parse GT positions (x, y, w, h)
+    if fp_sol_from_train is not None:
+        # Training data: fp_sol is [w, h, x, y]
+        gt_positions = [
+            (fp_sol_from_train[i, 2].item(), fp_sol_from_train[i, 3].item(),
+             fp_sol_from_train[i, 0].item(), fp_sol_from_train[i, 1].item())
+            for i in range(block_count)
+        ]
+    else:
+        gt_positions = []
+        for i in range(block_count):
+            verts = polygons[i]
+            if isinstance(verts, torch.Tensor):
+                valid = verts[verts[:, 0] != -1]
+            else:
+                valid = torch.tensor(verts)
+                valid = valid[valid[:, 0] != -1]
+            if valid.numel() > 0:
+                xy_min = valid.min(0).values
+                xy_max = valid.max(0).values
+                gt_positions.append((
+                    xy_min[0].item(), xy_min[1].item(),
+                    (xy_max[0] - xy_min[0]).item(),
+                    (xy_max[1] - xy_min[1]).item(),
+                ))
+            else:
+                gt_positions.append((0.0, 0.0, 0.0, 0.0))
 
     loss_parts = {
         "total":      l_total,
-        "coord":      None,
         "wirelength": l_wl,
         "area":       l_area,
-        "ratio":      l_ratio,
         "grouping":   l_grouping,
         "mib":        l_mib,
         "boundary":   l_boundary,
         "overlap":    l_overlap,
     }
+    if args.shard_idx is not None:
+        viz_title = f"Smoke test — shard idx={args.shard_idx} (block_count={block_count})"
+        viz_out   = _CONTEST_DIR / f"smoke_test_shard{args.shard_idx}_viz.png"
+    elif args.train_idx is not None:
+        viz_title = f"Smoke test — train idx={args.train_idx} (block_count={block_count})"
+        viz_out   = _CONTEST_DIR / f"smoke_test_train{args.train_idx}_viz.png"
+    else:
+        viz_title = f"Smoke test — val block_count={args.val_case}"
+        viz_out   = _CONTEST_DIR / "smoke_test_viz.png"
     save_floorplan_viz(
         gt_positions, positions, block_count,
-        out_path=_CONTEST_DIR / "smoke_test_viz.png",
-        title="Smoke test — validation case 0",
+        out_path=viz_out,
+        title=viz_title,
         loss_parts=loss_parts,
         constraints=constraints[:block_count],
     )

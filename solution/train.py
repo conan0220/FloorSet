@@ -8,8 +8,6 @@ Usage:
 
 import argparse
 import math
-import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -29,11 +27,12 @@ sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
 
 from config import (
     BATCH_SIZE, MAX_EPOCHS, PATIENCE, LEARNING_RATE, WARMUP_STEPS,
-    GRAD_CLIP_NORM, LAMBDA_COORD, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_RATIO,
+    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA,
     LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
     VALIDATE_EVERY, VIZ_BLOCK_SIZES, RAW_FEATURE_DIM,
-    LOGS_DIR, VIZ_DIR, CHECKPOINT_DIR, CONTEST_DIR,
+    LOGS_DIR, CHECKPOINT_DIR, CONTEST_DIR,
     CACHE_DIR, CACHE_PRELOAD,
+    LAMBDA_RATIO_REG, RATIO_REG_DECAY_EPOCHS,
 )
 from data.floorset_loader import (
     preprocess_sample,
@@ -46,12 +45,9 @@ from data.floorset_loader import (
     build_sort_inv,
 )
 from model.transformer_floorplan import TransformerFloorplan
-from loss.coord_loss      import coord_loss
 from loss.wirelength_loss import wirelength_loss
 from loss.area_loss       import area_loss
-from loss.ratio_loss      import ratio_loss
 from loss.violation_loss  import violation_loss
-from viz_utils            import save_floorplan_viz
 from inference            import ar_inference
 
 
@@ -60,7 +56,7 @@ from inference            import ar_inference
 # =============================================================================
 
 def _make_dirs():
-    for d in (LOGS_DIR, VIZ_DIR, CHECKPOINT_DIR):
+    for d in (LOGS_DIR, CHECKPOINT_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -170,7 +166,14 @@ def make_lr_lambda(warmup_steps: int, total_steps: int):
 # Loss computation
 # =============================================================================
 
-def compute_batch_loss(model, batch: dict, device: torch.device):
+def ratio_reg_weight(epoch: int) -> float:
+    """Linear decay: LAMBDA_RATIO_REG at epoch 0 → 0 at RATIO_REG_DECAY_EPOCHS."""
+    if epoch >= RATIO_REG_DECAY_EPOCHS:
+        return 0.0
+    return LAMBDA_RATIO_REG * (1.0 - epoch / RATIO_REG_DECAY_EPOCHS)
+
+
+def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0):
     """
     Forward pass + compute all loss terms.
 
@@ -206,31 +209,41 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
     # De-normalise for HPWL / area losses (raw pixel scale)
     pred_raw = pred_norm * crefs.view(-1, 1, 1)  # [B, k, 4]
 
-    l_coord = coord_loss(logits, gtn, cons, kpm)
     l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
     l_area  = area_loss(pred_raw, abase)
-    l_ratio = ratio_loss(pred_norm, gtn, cons, kpm)
     l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
 
-    total = (LAMBDA_COORD      * l_coord
-             + LAMBDA_WIRELENGTH * l_wl
+    # Ratio regularisation: penalise log(w/h)² on valid (non-padded) blocks.
+    # Weight decays linearly to 0 over RATIO_REG_DECAY_EPOCHS so physical losses
+    # gradually take full control of block shape.
+    lam_ratio = ratio_reg_weight(epoch)
+    if lam_ratio > 0:
+        pred_w = pred_norm[..., 2].clamp(min=1e-8)   # [B, k]
+        pred_h = pred_norm[..., 3].clamp(min=1e-8)   # [B, k]
+        log_ratio = torch.log(pred_w / pred_h)        # [B, k]
+        valid_2d  = valid.squeeze(-1)                 # [B, k]
+        l_ratio_reg = (log_ratio.pow(2) * valid_2d).sum() / valid_2d.sum().clamp(min=1)
+    else:
+        l_ratio_reg = pred_norm.new_zeros(1).squeeze()
+
+    total = (LAMBDA_WIRELENGTH * l_wl
              + LAMBDA_AREA       * l_area
-             + LAMBDA_RATIO      * l_ratio
              + LAMBDA_GROUPING   * l_grouping
              + LAMBDA_MIB        * l_mib
              + LAMBDA_BOUNDARY   * l_boundary
-             + LAMBDA_OVERLAP    * l_overlap)
+             + LAMBDA_OVERLAP    * l_overlap
+             + lam_ratio         * l_ratio_reg)
 
     return total, {
         "total":      total.item(),
-        "coord":      l_coord.item(),
         "wirelength": l_wl.item(),
         "area":       l_area.item(),
-        "ratio":      l_ratio.item(),
         "grouping":   l_grouping.item(),
         "mib":        l_mib.item(),
         "boundary":   l_boundary.item(),
         "overlap":    l_overlap.item(),
+        "ratio_reg":  l_ratio_reg.item(),
+        "lam_ratio":  lam_ratio,
     }, pred_norm
 
 
@@ -281,50 +294,62 @@ def update_loss_plot(epoch_losses: list, save_path: Path):
 # Official validation (subprocess)
 # =============================================================================
 
-def run_official_validation(epoch: int, log_file: Path, dry_run: bool = False) -> float:
+def validate_with_solve(
+    model,
+    epoch:    int,
+    device:   torch.device,
+    log_file: Path,
+    n_samples: int = 10,
+    dry_run:  bool = False,
+) -> float:
     """
-    Run the official evaluator as a subprocess.
-    Prints output to terminal and appends to log_file.
-    Returns the parsed Total Score (lower is better), or inf on failure.
+    Run AR inference (= solve core) on n_samples validation cases.
+    Returns average total loss across samples (lower is better).
     """
-    header = f"========== Epoch {epoch} =========="
-    print(header)
-
     if dry_run:
-        msg = "[smoke-test] Skipping official evaluator — dry run.\n"
-        print(msg)
-        with open(log_file, "a") as f:
-            f.write(header + "\n" + msg + "\n")
+        print(f"  [smoke-test] solve-val epoch={epoch} — skipped")
         return float("inf")
 
-    cmd = [
-        sys.executable,
-        str(CONTEST_DIR / "iccad2026_evaluate.py"),
-        "--evaluate",
-        str(CONTEST_DIR / "my_optimizer.py")
-    ]
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, cwd=str(_REPO_ROOT),
-        )
-        lines = []
-        for line in proc.stdout:
-            print(line, end="", flush=True)
-            lines.append(line)
-        proc.wait()
-        output = "".join(lines)
-    except Exception as e:
-        output = f"[ERROR] Failed to run evaluator: {e}\n"
-        print(output, end="")
+        sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
+        from lite_dataset_test import FloorplanDatasetLiteTest
+        dataset = FloorplanDatasetLiteTest(str(_REPO_ROOT) + "/")
+    except ImportError:
+        print("[val] FloorplanDatasetLiteTest not importable — skipping solve-val")
+        return float("inf")
 
+    model.eval()
+    losses = []
+    # Use the same block sizes as visualisation for consistency
+    cases = [sz for sz in VIZ_BLOCK_SIZES if sz - 21 < len(dataset)][:n_samples]
+
+    with torch.no_grad():
+        for sz in cases:
+            idx = sz - 21
+            sample = dataset[idx]
+            inputs, labels = sample["input"], sample["label"]
+            area_target, b2b_conn, p2b_conn, pins_pos, constraints = inputs
+            polygons, val_metrics = labels
+
+            block_count = int((area_target != -1).sum().item())
+            fp_sol = _polygons_to_fp_sol(polygons, block_count)
+            fp_full = torch.zeros(area_target.shape[0], 4)
+            fp_full[:block_count] = fp_sol
+
+            s = preprocess_sample(
+                area_target, b2b_conn, p2b_conn,
+                pins_pos, constraints, fp_full, val_metrics,
+            )
+            pred_norm, _ = ar_inference(model, s, device)   # [1, k, 4]
+            lp = _compute_viz_loss(s, pred_norm, device)
+            losses.append(lp["total"])
+
+    avg = sum(losses) / len(losses) if losses else float("inf")
+    detail = "  ".join(f"{v:.4f}" for v in losses)
+    print(f"  [val] epoch={epoch}  avg={avg:.4f}  [{detail}]")
     with open(log_file, "a") as f:
-        f.write(header + "\n" + output + "\n")
-
-    # Parse Total Score from evaluator output
-    match = re.search(r"Total Score:\s*([\d.]+)", output)
-    return float(match.group(1)) if match else float("inf")
+        f.write(f"Epoch {epoch}: avg={avg:.4f}  samples=[{detail}]\n")
+    return avg
 
 
 # =============================================================================
@@ -387,7 +412,6 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
     with torch.no_grad():
         l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
         l_area  = area_loss(pred_raw, abase).item()
-        l_ratio = ratio_loss(pred_norm, gtn, cons, kpm_viz).item()
         l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
         l_grouping  = l_grouping.item()
         l_mib       = l_mib.item()
@@ -395,7 +419,6 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
         l_overlap   = l_overlap.item()
         total = (LAMBDA_WIRELENGTH * l_wl
                  + LAMBDA_AREA     * l_area
-                 + LAMBDA_RATIO    * l_ratio
                  + LAMBDA_GROUPING * l_grouping
                  + LAMBDA_MIB      * l_mib
                  + LAMBDA_BOUNDARY * l_boundary
@@ -403,10 +426,8 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
 
     return {
         "total":      total,
-        "coord":      None,   # AR mode has no logits
         "wirelength": l_wl,
         "area":       l_area,
-        "ratio":      l_ratio,
         "grouping":   l_grouping,
         "mib":        l_mib,
         "boundary":   l_boundary,
@@ -414,92 +435,6 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
     }
 
 
-def _infer_and_save(model, s: dict, epoch: int, device, source: str, label: str):
-    """Run AR inference on one preprocessed sample dict, compute loss, save figure."""
-    pred_norm, pred_raw = ar_inference(model, s, device)      # [1,k,4], [k,4]
-    gt_raw    = s["gt_positions_raw"][:s["block_count"]]      # [k, 4] sorted
-
-    loss_parts  = _compute_viz_loss(s, pred_norm, device)
-    constraints = s["constraints_sorted"][:s["block_count"]].cpu()   # [k, 5]
-
-    _save_viz(gt_raw, pred_raw, epoch, s["block_count"], source=source,
-              label=label, loss_parts=loss_parts, constraints=constraints)
-
-
-def visualize_predictions(
-    model:    nn.Module,
-    epoch:    int,
-    device:   torch.device,
-    dry_run:  bool = False,
-):
-    """
-    Saves GT-vs-Predicted figures for:
-      - 10 validation cases  (one per block size in VIZ_BLOCK_SIZES)
-      - 10 training cases    (evenly spaced from the first shard of the cache)
-    """
-    if dry_run:
-        print(f"  [smoke-test] viz epoch={epoch} — skipped (dry run)")
-        return
-
-    model.eval()
-    with torch.no_grad():
-
-        # ── Validation cases ──────────────────────────────────────────────
-        try:
-            from lite_dataset_test import FloorplanDatasetLiteTest
-            dataset = FloorplanDatasetLiteTest(str(_REPO_ROOT) + "/")
-        except ImportError:
-            print("[viz] FloorplanDatasetLiteTest not importable — skipping val viz.")
-            dataset = None
-
-        if dataset is not None:
-            for sz in VIZ_BLOCK_SIZES:
-                test_id = sz - 21
-                if test_id >= len(dataset):
-                    continue
-                sample = dataset[test_id]
-                inputs, labels = sample["input"], sample["label"]
-                area_target, b2b_conn, p2b_conn, pins_pos, constraints = inputs
-                polygons, val_metrics = labels
-
-                block_count = int((area_target != -1).sum().item())
-                fp_sol = _polygons_to_fp_sol(polygons, block_count)
-                fp_full = torch.zeros(area_target.shape[0], 4)
-                fp_full[:block_count] = fp_sol
-
-                s = preprocess_sample(
-                    area_target, b2b_conn, p2b_conn,
-                    pins_pos, constraints, fp_full, val_metrics,
-                )
-                _infer_and_save(model, s, epoch, device,
-                                source="val", label=f"case_{sz}")
-
-        # ── Training cases (from cache first shard) ───────────────────────
-        shard_path = CACHE_DIR / "shard_000000.pt"
-        if not shard_path.exists():
-            print("[viz] No cache shard found — skipping train viz.")
-            return
-
-        shard: list = torch.load(shard_path, weights_only=False)
-        n_train = min(10, len(shard))
-        step = max(1, len(shard) // n_train)
-        train_samples = [shard[i * step] for i in range(n_train)]
-
-        for idx, s in enumerate(train_samples):
-            _infer_and_save(model, s, epoch, device,
-                            source="train", label=f"sample_{idx:04d}")
-
-
-def _save_viz(gt_raw, pred_raw, epoch: int, block_count: int,
-              source: str, label: str, loss_parts: dict,
-              constraints=None):
-    out = VIZ_DIR / f"epoch_{epoch:03d}_{source}_{label}.png"
-    save_floorplan_viz(
-        gt_raw, pred_raw, block_count, out_path=out,
-        title=f"Epoch {epoch} [{source}] {label}  ({block_count} blocks)",
-        loss_parts=loss_parts,
-        constraints=constraints,
-    )
 
 
 # =============================================================================
@@ -595,16 +530,14 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
 
             # Forward + backward
             optimizer.zero_grad()
-            loss, loss_parts, pred_norm_ = compute_batch_loss(model, batch, device)
+            loss, loss_parts, pred_norm_ = compute_batch_loss(model, batch, device, epoch=epoch)
 
             if not torch.isfinite(loss):
                 lr_now = scheduler.get_last_lr()[0]
                 p = pred_norm_.detach().float()
                 print(f"  [warn] non-finite loss at epoch={epoch} step={batch_idx}")
-                print(f"    coord      = {loss_parts['coord']}")
                 print(f"    wirelength = {loss_parts['wirelength']}")
                 print(f"    area       = {loss_parts['area']}")
-                print(f"    ratio      = {loss_parts['ratio']}")
                 print(f"    grouping   = {loss_parts['grouping']}")
                 print(f"    mib        = {loss_parts['mib']}")
                 print(f"    boundary   = {loss_parts['boundary']}")
@@ -632,14 +565,13 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
             if smoke_test:
                 lr_now = scheduler.get_last_lr()[0]
                 print(f"  step={global_step}  loss={loss_parts['total']:.4f}"
-                      f"  coord={loss_parts['coord']:.4f}"
                       f"  wl={loss_parts['wirelength']:.4f}"
                       f"  area={loss_parts['area']:.4f}"
-                      f"  ratio={loss_parts['ratio']:.4f}"
                       f"  grp={loss_parts['grouping']:.4f}"
                       f"  mib={loss_parts['mib']:.4f}"
                       f"  bnd={loss_parts['boundary']:.4f}"
                       f"  ovlp={loss_parts['overlap']:.4f}"
+                      f"  ratio_reg={loss_parts['ratio_reg']:.4f}(×{loss_parts['lam_ratio']:.2f})"
                       f"  lr={lr_now:.2e}")
 
         # ── Epoch-end logging ─────────────────────────────────────────────
@@ -657,11 +589,9 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
 
         # ── Validation every N epochs ─────────────────────────────────────
         if epoch % validate_every == 0:
-            visualize_predictions(model, epoch, device, dry_run=smoke_test)
-            score = run_official_validation(
-                epoch, log_file, dry_run=smoke_test
+            score = validate_with_solve(
+                model, epoch, device, log_file, dry_run=smoke_test
             )
-            # score = 10
 
             if score < best_score:
                 best_score = score
@@ -673,7 +603,7 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
                 no_improve_count += 1
                 print(f"  → no improvement ({no_improve_count}/{patience_eff})")
 
-            # visualize_predictions(model, epoch, device, dry_run=smoke_test)
+
 
             if no_improve_count >= patience_eff:
                 print(f"Early stopping: no improvement for {patience_eff} validations.")

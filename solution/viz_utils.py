@@ -13,7 +13,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import (
-    LAMBDA_COORD, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_RATIO,
+    LAMBDA_WIRELENGTH, LAMBDA_AREA,
     LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
 )
 
@@ -113,14 +113,10 @@ def save_floorplan_viz(
         fig.suptitle(title)
 
     if loss_parts is not None:
-        coord_str = "unknown" if loss_parts['coord'] is None else f"{LAMBDA_COORD * loss_parts['coord']:.4f}"
-        ratio_str = "unknown" if loss_parts.get('ratio') is None else f"{LAMBDA_RATIO * loss_parts['ratio']:.4f}"
         loss_text = (
             f"total={loss_parts['total']:.4f}  "
-            f"coord={coord_str}  "
             f"wl={LAMBDA_WIRELENGTH * loss_parts['wirelength']:.4f}  "
             f"area={LAMBDA_AREA * loss_parts['area']:.4f}  "
-            f"ratio={ratio_str}  "
             f"grp={LAMBDA_GROUPING * loss_parts['grouping']:.4f}  "
             f"mib={LAMBDA_MIB * loss_parts['mib']:.4f}  "
             f"bnd={LAMBDA_BOUNDARY * loss_parts['boundary']:.4f}  "

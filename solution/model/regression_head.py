@@ -133,8 +133,15 @@ class DiscreteRegressionHead(nn.Module):
         G = grid_size
         self.shared     = nn.Sequential(nn.Linear(d_model, hidden), nn.ReLU())
         self.xy_head    = nn.Linear(hidden, G * G)
-        self.ratio_head = nn.Linear(hidden, 1)
+        self.ratio_head = nn.Linear(hidden + 2, 1)  # +2: conditioning on predicted (x, y)
         self._fallback_count = 0   # reset by TransformerFloorplan before each AR pass
+
+        # Pre-computed grid cell coordinates for soft-argmax (training mode).
+        # cell_gx[i] = (i % G) / G  → normalised x of cell i
+        # cell_gy[i] = (i // G) / G → normalised y of cell i
+        indices = torch.arange(G * G)
+        self.register_buffer('cell_gx', (indices % G).float() / G)   # [G*G]
+        self.register_buffer('cell_gy', (indices // G).float() / G)  # [G*G]
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -248,14 +255,29 @@ class DiscreteRegressionHead(nn.Module):
             Returns pred_positions [B,1,4]
             Updates occupancy and placed_blocks in-place.
         """
-        h         = self.shared(x)          # [..., hidden]
-        logits    = self.xy_head(h)          # [..., G*G]
-        ratio_raw = self.ratio_head(h)       # [..., 1]
+        h      = self.shared(x)          # [..., hidden]
+        logits = self.xy_head(h)          # [..., G*G]
 
         if occupancy is None:
-            # ── Training mode ──────────────────────────────────────
-            flat_idx       = logits.argmax(dim=-1)
-            pred_positions = self._build_positions(flat_idx, token_features, ratio_raw)
+            # ── Training mode: soft-argmax (differentiable) ────────
+            # Step 1: decide position via soft-argmax
+            weights = logits.softmax(dim=-1)                    # [B, k, G*G]
+            x = (weights * self.cell_gx).sum(dim=-1)            # [B, k]
+            y = (weights * self.cell_gy).sum(dim=-1)            # [B, k]
+
+            # Preplaced blocks: override with hard-constrained coordinates
+            is_preplaced = token_features[..., 3] > 0
+            x = torch.where(is_preplaced, token_features[..., 6], x)
+            y = torch.where(is_preplaced, token_features[..., 7], y)
+
+            # Step 2: decide shape conditioned on position
+            # ratio_head receives (h, x, y) so it can learn context-aware shapes:
+            # e.g. boundary block placed at left edge → wide shape fits better
+            xy = torch.stack([x, y], dim=-1)                    # [B, k, 2]
+            ratio_raw = self.ratio_head(torch.cat([h, xy], dim=-1))  # [B, k, 1]
+
+            pred_w, pred_h = self._decode_size(token_features, ratio_raw)
+            pred_positions = torch.stack([x, y, pred_w, pred_h], dim=-1)
             return pred_positions, logits
 
         else:
@@ -274,11 +296,7 @@ class DiscreteRegressionHead(nn.Module):
             if all_inf.any():
                 logits_masked[all_inf] = logits_step[all_inf]
 
-            # Continuous w, h for exact check and occupancy update
-            pred_w, pred_h = self._decode_size(token_features, ratio_raw)
-            pred_w = pred_w[:, 0]  # [B]
-            pred_h = pred_h[:, 0]  # [B]
-
+            # Step 1: decide position (argmax of masked logits)
             final_x = torch.zeros(B, device=device)
             final_y = torch.zeros(B, device=device)
 
@@ -286,32 +304,54 @@ class DiscreteRegressionHead(nn.Module):
                 is_pre = tf_step[b, 3].item() > 0   # is_preplaced
 
                 if is_pre:
-                    # Hard-constrained: use target x/y directly
                     final_x[b] = tf_step[b, 6]       # target_x
                     final_y[b] = tf_step[b, 7]       # target_y
-                    if placed_blocks is not None:
-                        placed_blocks[b].append((
-                            final_x[b].item(), final_y[b].item(),
-                            pred_w[b].item(),  pred_h[b].item(),
-                        ))
                 else:
                     if placed_blocks is not None:
-                        x_n, y_n, is_fb = place_with_exact_check(
-                            logits_masked[b].clone(),
-                            placed_blocks[b],
-                            pred_w[b].item(),
-                            pred_h[b].item(),
-                            G,
-                        )
-                        if is_fb:
-                            self._fallback_count += 1
-                        final_x[b] = x_n
-                        final_y[b] = y_n
-                        placed_blocks[b].append((x_n, y_n, pred_w[b].item(), pred_h[b].item()))
+                        # Placeholder placement using unit square for overlap check;
+                        # real w, h computed after position is fixed below.
+                        idx = logits_masked[b].argmax().item()
+                        final_x[b] = (idx % G) / G
+                        final_y[b] = (idx // G) / G
                     else:
                         idx        = logits_masked[b].argmax().item()
                         final_x[b] = (idx % G) / G
                         final_y[b] = (idx // G) / G
+
+            # Step 2: decide shape conditioned on final position
+            h_step  = h[:, 0, :]                                       # [B, hidden]
+            xy_step = torch.stack([final_x, final_y], dim=-1)          # [B, 2]
+            ratio_raw_step = self.ratio_head(
+                torch.cat([h_step, xy_step], dim=-1)
+            ).unsqueeze(1)                                              # [B, 1, 1]
+
+            pred_w, pred_h = self._decode_size(token_features, ratio_raw_step)
+            pred_w = pred_w[:, 0]  # [B]
+            pred_h = pred_h[:, 0]  # [B]
+
+            # Exact overlap check now that real w, h are known
+            for b in range(B):
+                is_pre = tf_step[b, 3].item() > 0
+                if not is_pre and placed_blocks is not None:
+                    x_n, y_n, is_fb = place_with_exact_check(
+                        logits_masked[b].clone(),
+                        placed_blocks[b],
+                        pred_w[b].item(),
+                        pred_h[b].item(),
+                        G,
+                    )
+                    if is_fb:
+                        self._fallback_count += 1
+                    final_x[b] = x_n
+                    final_y[b] = y_n
+
+            # Register placed blocks
+            for b in range(B):
+                if placed_blocks is not None:
+                    placed_blocks[b].append((
+                        final_x[b].item(), final_y[b].item(),
+                        pred_w[b].item(),  pred_h[b].item(),
+                    ))
 
             pred_positions = torch.stack(
                 [final_x, final_y, pred_w, pred_h], dim=-1

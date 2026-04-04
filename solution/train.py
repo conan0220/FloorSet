@@ -29,7 +29,7 @@ sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
 
 from config import (
     BATCH_SIZE, MAX_EPOCHS, PATIENCE, LEARNING_RATE, WARMUP_STEPS,
-    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_RATIO,
+    GRAD_CLIP_NORM, LAMBDA_COORD, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_RATIO,
     LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
     VALIDATE_EVERY, VIZ_BLOCK_SIZES, RAW_FEATURE_DIM,
     LOGS_DIR, VIZ_DIR, CHECKPOINT_DIR, CONTEST_DIR,
@@ -172,11 +172,12 @@ def make_lr_lambda(warmup_steps: int, total_steps: int):
 
 def compute_batch_loss(model, batch: dict, device: torch.device):
     """
-    Forward pass + compute all four loss terms.
+    Forward pass + compute all loss terms.
 
     Returns:
         total_loss  (scalar, differentiable)
         dict of individual scalar .item() values for logging
+        pred_norm   [B, k, 4] for external use
     """
     tf   = batch["token_features"].to(device)
     wi   = batch["w_int"].to(device)
@@ -211,7 +212,7 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
     l_ratio = ratio_loss(pred_norm, gtn, cons, kpm)
     l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
 
-    total = (l_coord
+    total = (LAMBDA_COORD      * l_coord
              + LAMBDA_WIRELENGTH * l_wl
              + LAMBDA_AREA       * l_area
              + LAMBDA_RATIO      * l_ratio

@@ -82,13 +82,15 @@ WARMUP_STEPS   = 4000       # linear warmup before cosine decay
 GRAD_CLIP_NORM = 1.0
 
 # Loss weights
+LAMBDA_COORD      = 0.1     # weight for L_coord     (grid cross-entropy; soft-argmax gives xy_head physical gradients)
 LAMBDA_WIRELENGTH = 0.3     # weight for L_wirelength
 LAMBDA_AREA       = 0.3     # weight for L_area
-LAMBDA_RATIO      = 0.5     # weight for L_ratio     (aspect ratio supervision)
+LAMBDA_RATIO      = 0.1     # weight for L_ratio     (aspect ratio supervision, reduced from 0.5)
 LAMBDA_GROUPING   = 0.1     # weight for V_grouping  (cluster centroid distance)
 LAMBDA_MIB        = 0.1     # weight for V_mib       (macro-in-block size deviation)
 LAMBDA_BOUNDARY   = 0.1     # weight for V_boundary  (boundary gap penalty)
 LAMBDA_OVERLAP    = 50.0    # weight for V_overlap   (pairwise overlap area)
+
 
 # Extra weight on preplaced blocks in L_coord
 PREPLACED_COORD_WEIGHT = 5.0

@@ -4,11 +4,18 @@ Shared floorplan visualisation utilities.
 Used by both solution/train.py and iccad2026contest/my_optimizer.py.
 """
 
+import sys
 from pathlib import Path
 
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import (
+    LAMBDA_COORD, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_RATIO,
+    LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
+)
 
 # Block type → (facecolor, legend label)
 BLOCK_TYPE_COLORS = {
@@ -79,6 +86,15 @@ def save_floorplan_viz(
                 linewidth=0.8, edgecolor="black",
                 facecolor=facecolor, alpha=0.7,
             ))
+            # Label cluster blocks with their group ID
+            if constraints is not None:
+                group_id = int(constraints[i][3])
+                if group_id > 0:
+                    ax.text(
+                        x + w / 2, y + h / 2, str(group_id),
+                        ha="center", va="center",
+                        fontsize=6, fontweight="bold", color="black",
+                    )
         ax.autoscale()
         ax.set_aspect("equal")
         ax.set_xlabel("X")
@@ -97,18 +113,18 @@ def save_floorplan_viz(
         fig.suptitle(title)
 
     if loss_parts is not None:
-        coord_str = "unknown" if loss_parts['coord'] is None else f"{loss_parts['coord']:.4f}"
-        ratio_str = "unknown" if loss_parts.get('ratio') is None else f"{loss_parts['ratio']:.4f}"
+        coord_str = "unknown" if loss_parts['coord'] is None else f"{LAMBDA_COORD * loss_parts['coord']:.4f}"
+        ratio_str = "unknown" if loss_parts.get('ratio') is None else f"{LAMBDA_RATIO * loss_parts['ratio']:.4f}"
         loss_text = (
             f"total={loss_parts['total']:.4f}  "
             f"coord={coord_str}  "
-            f"wl={loss_parts['wirelength']:.4f}  "
-            f"area={loss_parts['area']:.4f}  "
+            f"wl={LAMBDA_WIRELENGTH * loss_parts['wirelength']:.4f}  "
+            f"area={LAMBDA_AREA * loss_parts['area']:.4f}  "
             f"ratio={ratio_str}  "
-            f"grp={loss_parts['grouping']:.4f}  "
-            f"mib={loss_parts['mib']:.4f}  "
-            f"bnd={loss_parts['boundary']:.4f}  "
-            f"ovlp={loss_parts['overlap']:.4f}"
+            f"grp={LAMBDA_GROUPING * loss_parts['grouping']:.4f}  "
+            f"mib={LAMBDA_MIB * loss_parts['mib']:.4f}  "
+            f"bnd={LAMBDA_BOUNDARY * loss_parts['boundary']:.4f}  "
+            f"ovlp={LAMBDA_OVERLAP * loss_parts['overlap']:.4f}"
         )
         fig.text(0.5, 0.01, loss_text, ha="center", va="bottom",
                  fontsize=8, family="monospace",

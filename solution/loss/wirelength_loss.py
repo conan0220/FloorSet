@@ -43,8 +43,10 @@ def wirelength_loss(
     device   = pred.device
 
     # ── Block centres ──────────────────────────────────────────────
-    cx = pred[:, :, 0] + pred[:, :, 2] / 2   # [B, k]
-    cy = pred[:, :, 1] + pred[:, :, 3] / 2   # [B, k]
+    # Detach w/h so wirelength gradient flows only to x, y (xy_head).
+    # Block shape is determined by area/overlap/mib losses, not wirelength.
+    cx = pred[:, :, 0] + pred[:, :, 2].detach() / 2   # [B, k]
+    cy = pred[:, :, 1] + pred[:, :, 3].detach() / 2   # [B, k]
 
     # ── Inter-module HPWL ──────────────────────────────────────────
     # Pairwise Manhattan between all block centres: [B, k, k]

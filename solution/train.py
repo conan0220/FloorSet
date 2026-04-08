@@ -446,7 +446,7 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
 # Main training loop
 # =============================================================================
 
-def train(smoke_test: bool = False, num_shards: int | None = None):
+def train(smoke_test: bool = False, num_shards: int | None = None, verbose_loss: bool = False):
     _make_dirs()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -520,7 +520,9 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
     # ══════════════════════════════════════════════════════════════════════
     for epoch in range(start_epoch + 1, max_epochs_eff + 1):
         model.train()
-        running_loss = 0.0
+        running_loss  = 0.0
+        running_parts = {"wirelength": 0.0, "area": 0.0, "grouping": 0.0,
+                         "mib": 0.0, "boundary": 0.0, "overlap": 0.0}
         n_steps = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch",
@@ -559,29 +561,49 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
             scheduler.step()
 
             running_loss += loss_parts["total"]
+            running_parts["wirelength"] += loss_parts["wirelength"]
+            running_parts["area"]       += loss_parts["area"]
+            running_parts["grouping"]   += loss_parts["grouping"]
+            running_parts["mib"]        += loss_parts["mib"]
+            running_parts["boundary"]   += loss_parts["boundary"]
+            running_parts["overlap"]    += loss_parts["overlap"]
             n_steps += 1
             global_step += 1
 
-            pbar.set_postfix(
-                loss=f"{loss_parts['total']:.4f}",
-                samples=f"{(batch_idx + 1) * batch_size_eff}",
-            )
-
-            if smoke_test:
-                lr_now = scheduler.get_last_lr()[0]
-                print(f"  step={global_step}  loss={loss_parts['total']:.4f}"
-                      f"  wl={loss_parts['wirelength']:.4f}"
-                      f"  area={loss_parts['area']:.4f}"
-                      f"  grp={loss_parts['grouping']:.4f}"
-                      f"  mib={loss_parts['mib']:.4f}"
-                      f"  bnd={loss_parts['boundary']:.4f}"
-                      f"  ovlp={loss_parts['overlap']:.4f}"
-                      f"  lr={lr_now:.2e}")
+            if smoke_test or verbose_loss:
+                p = loss_parts
+                pbar.set_postfix(ordered_dict={
+                    "loss": f"{p['total']:.4f}",
+                    "area": f"{p['area']:.4f}",
+                    "wl":   f"{p['wirelength']:.4f}",
+                    "grp":  f"{p['grouping']:.4f}",
+                    "mib":  f"{p['mib']:.4f}",
+                    "bnd":  f"{p['boundary']:.4f}",
+                    "ovlp": f"{p['overlap']:.4f}",
+                    "samples": f"{(batch_idx + 1) * batch_size_eff}",
+                })
+            else:
+                pbar.set_postfix(
+                    loss=f"{loss_parts['total']:.4f}",
+                    samples=f"{(batch_idx + 1) * batch_size_eff}",
+                )
 
         # ── Epoch-end logging ─────────────────────────────────────────────
         avg_loss = running_loss / max(n_steps, 1)
         epoch_losses.append(avg_loss)
-        print(f"Epoch {epoch:3d} | avg_loss={avg_loss:.4f} | steps={n_steps}")
+        if verbose_loss or smoke_test:
+            s = max(n_steps, 1)
+            rp = running_parts
+            print(f"Epoch {epoch:3d} | avg_loss={avg_loss:.4f}"
+                  f"  area={rp['area']/s:.4f}"
+                  f"  wl={rp['wirelength']/s:.4f}"
+                  f"  grp={rp['grouping']/s:.4f}"
+                  f"  mib={rp['mib']/s:.4f}"
+                  f"  bnd={rp['boundary']/s:.4f}"
+                  f"  ovlp={rp['overlap']/s:.4f}"
+                  f" | steps={n_steps}")
+        else:
+            print(f"Epoch {epoch:3d} | avg_loss={avg_loss:.4f} | steps={n_steps}")
 
         # Loss curve
         update_loss_plot(epoch_losses, LOGS_DIR / "loss_curve.png")
@@ -634,5 +656,9 @@ if __name__ == "__main__":
         "--num-shards", type=int, default=None,
         help="Use only the first N cache shards (default: all)"
     )
+    parser.add_argument(
+        "--verbose-loss", action="store_true",
+        help="Print per-component loss breakdown every step"
+    )
     args = parser.parse_args()
-    train(smoke_test=args.smoke_test, num_shards=args.num_shards)
+    train(smoke_test=args.smoke_test, num_shards=args.num_shards, verbose_loss=args.verbose_loss)

@@ -89,8 +89,8 @@ LAMBDA_BOUNDARY   = 0.1     # weight for V_boundary  (boundary gap penalty)
 LAMBDA_OVERLAP    = 50.0    # weight for V_overlap   (pairwise overlap area)
 
 # Aspect ratio (w/h) hard clamp in ContinuousRegressionHead
-MIN_RATIO = 0.2   # w/h lower bound (block at most 5× taller than wide)
-MAX_RATIO = 5.0   # w/h upper bound (block at most 5× wider than tall)
+MIN_RATIO = 0.33   # w/h lower bound (block at most 5× taller than wide)
+MAX_RATIO = 3.0   # w/h upper bound (block at most 5× wider than tall)
 
 
 # =============================================================================

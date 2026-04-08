@@ -180,6 +180,9 @@ python solution/train.py --checkpoint best.pt
 
 # 只使用前 N 個 cache shard 訓練（快速實驗用，例如只用 1 個 shard）
 python solution/train.py --num-shards 1
+
+# 輸出細部 loss（每 step 的進度列 + 每 epoch 結尾行均顯示各項分量）
+python solution/train.py --verbose-loss
 ```
 
 每 `VALIDATE_EVERY=5` 個 epoch 自動呼叫官方評估器（subprocess），Avg Cost 最佳的 checkpoint 存至 `checkpoints/best.pt`。

@@ -511,6 +511,94 @@ class SimulatedAnnealingOptimizer(FloorplanOptimizer):
 
 
 # =============================================================================
+# TRAINING LOSS BREAKDOWN
+# =============================================================================
+
+def _print_training_loss(
+    positions,       # List[(x,y,w,h)] original order, raw pixel space
+    area_target,     # [n_padded]
+    b2b_conn,        # [n_edges, 3]
+    p2b_conn,        # [n_edges, 3]
+    pins_pos,        # [n_pins, 2]
+    constraints,     # [n_padded, 5]
+    labels,          # (polygons, metrics) from dataset
+    target_pos,      # List[(x,y,w,h)] GT positions in original order, raw pixel
+    test_id: int,
+):
+    """Compute and print weighted training loss components for one test case."""
+    import sys
+    from pathlib import Path as _Path
+    _repo = _Path(__file__).resolve().parent.parent
+    if str(_repo / "solution") not in sys.path:
+        sys.path.insert(0, str(_repo / "solution"))
+
+    import torch as _torch
+    from data.floorset_loader import preprocess_sample
+    from loss.wirelength_loss import wirelength_loss
+    from loss.area_loss import area_loss
+    from loss.violation_loss import violation_loss
+    from config import (
+        LAMBDA_WIRELENGTH, LAMBDA_AREA,
+        LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
+    )
+
+    _, metrics_raw = labels
+
+    # Build fp_sol [n_padded, 4] as [w, h, x, y] from GT positions
+    n_padded = area_target.shape[0]
+    fp_sol = _torch.zeros(n_padded, 4)
+    for i, (x, y, w, h) in enumerate(target_pos):
+        fp_sol[i] = _torch.tensor([w, h, x, y])
+
+    s = preprocess_sample(
+        area_target, b2b_conn, p2b_conn, pins_pos, constraints, fp_sol, metrics_raw
+    )
+    k          = s["block_count"]
+    canvas_ref = s["canvas_ref"]
+    sort_idx   = s["sort_idx"]   # original → sorted
+    sort_inv   = s["sort_inv"]   # original → sorted position
+
+    # Convert predicted positions (original order, raw pixel) → sorted, normalised
+    pos_tensor = _torch.tensor(positions, dtype=_torch.float32)   # [k, 4]
+    pos_sorted = pos_tensor[sort_idx]                              # [k, 4] sorted order
+    pred_norm  = (pos_sorted / canvas_ref).unsqueeze(0)           # [1, k, 4]
+    pred_raw   = pos_sorted.unsqueeze(0)                          # [1, k, 4] raw
+
+    tf    = s["token_features"][:k].unsqueeze(0)       # [1, k, 21]
+    wi    = s["w_int"][:k, :k].unsqueeze(0)            # [1, k, k]
+    cons  = s["constraints_sorted"][:k].unsqueeze(0)   # [1, k, 5]
+    pins  = s["pins_pos"].unsqueeze(0)                 # [1, p, 2]
+    p2b   = s["p2b_conn"].unsqueeze(0)                 # [1, e, 3]
+    hbase = _torch.tensor([s["hpwl_baseline"]])        # [1]
+    abase = _torch.tensor([s["area_baseline"]])        # [1]
+
+    with _torch.no_grad():
+        l_wl                              = wirelength_loss(pred_raw, wi, pins, p2b, hbase)
+        l_area                            = area_loss(pred_raw, abase)
+        v_grouping, v_mib, v_boundary, v_overlap = violation_loss(pred_norm, cons)
+
+    w_wl   = LAMBDA_WIRELENGTH * l_wl.item()
+    w_area = LAMBDA_AREA       * l_area.item()
+    w_grp  = LAMBDA_GROUPING   * v_grouping.item()
+    w_mib  = LAMBDA_MIB        * v_mib.item()
+    w_bnd  = LAMBDA_BOUNDARY   * v_boundary.item()
+    w_ovlp = LAMBDA_OVERLAP    * v_overlap.item()
+    total  = w_wl + w_area + w_grp + w_mib + w_bnd + w_ovlp
+
+    print(f"\n  [loss] Test {test_id} (canvas_ref={canvas_ref:.2f})")
+    print(f"    {'component':<18} {'raw':>10}  {'weight':>8}  {'weighted':>10}")
+    print(f"    {'-'*50}")
+    print(f"    {'wirelength':<18} {l_wl.item():>10.6f}  {'×'+str(LAMBDA_WIRELENGTH):>8}  {w_wl:>10.6f}")
+    print(f"    {'area':<18} {l_area.item():>10.6f}  {'×'+str(LAMBDA_AREA):>8}  {w_area:>10.6f}")
+    print(f"    {'v_grouping':<18} {v_grouping.item():>10.6f}  {'×'+str(LAMBDA_GROUPING):>8}  {w_grp:>10.6f}")
+    print(f"    {'v_mib':<18} {v_mib.item():>10.6f}  {'×'+str(LAMBDA_MIB):>8}  {w_mib:>10.6f}")
+    print(f"    {'v_boundary':<18} {v_boundary.item():>10.6f}  {'×'+str(LAMBDA_BOUNDARY):>8}  {w_bnd:>10.6f}")
+    print(f"    {'v_overlap':<18} {v_overlap.item():>10.6f}  {'×'+str(LAMBDA_OVERLAP):>8}  {w_ovlp:>10.6f}")
+    print(f"    {'-'*50}")
+    print(f"    {'TOTAL':<18} {'':>10}  {'':>8}  {total:>10.6f}")
+
+
+# =============================================================================
 # EVALUATION ENGINE
 # =============================================================================
 class ContestEvaluator:
@@ -599,6 +687,7 @@ class ContestEvaluator:
         test_ids: Optional[List[int]] = None,
         timeout: float = 60.0,
         viz_dir: Optional[Path] = None,
+        compute_loss: bool = False,
     ) -> EvaluationResult:
         """Run full evaluation."""
         self._load_dataset()
@@ -661,6 +750,13 @@ class ContestEvaluator:
                     area_baseline=metrics.bbox_area_baseline,
                     positions=positions
                 ))
+
+                # Training loss breakdown
+                if compute_loss:
+                    _print_training_loss(
+                        positions, area_target, b2b_conn, p2b_conn,
+                        pins_pos, constraints, labels, target_pos, idx,
+                    )
 
                 # Visualize GT vs Pred
                 if viz_dir is not None and VIZ_AVAILABLE:
@@ -1597,6 +1693,8 @@ def main():
     parser.add_argument('--checkpoint', type=str, default=None,
                        help='Checkpoint filename to load (e.g. best.pt, latest.pt); '
                             'default: best.pt → latest.pt')
+    parser.add_argument('--loss', action='store_true',
+                       help='Compute and print weighted training loss components for each test case')
 
     args = parser.parse_args()
 
@@ -1617,7 +1715,8 @@ def main():
         else:
             viz_dir = None
 
-        result = evaluator.evaluate(args.evaluate, test_ids, viz_dir=viz_dir)
+        result = evaluator.evaluate(args.evaluate, test_ids, viz_dir=viz_dir,
+                                    compute_loss=args.loss)
         
         # Print per-case detailed breakdown
         print("\n" + "=" * 100)

@@ -178,6 +178,9 @@ python solution/train.py
 
 # 從指定 checkpoint 繼續訓練
 python solution/train.py --checkpoint best.pt
+
+# 只使用前 N 個 cache shard 訓練（快速實驗用，例如只用 1 個 shard）
+python solution/train.py --num-shards 1
 ```
 
 每 `VALIDATE_EVERY=5` 個 epoch 自動呼叫官方評估器（subprocess），Avg Cost 最佳的 checkpoint 存至 `checkpoints/best.pt`。

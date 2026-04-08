@@ -628,9 +628,8 @@ class MyOptimizer(FloorplanOptimizer):
                     float(pred_original[i, 3]),   # h
                 ))
 
-        # Post-placement legalization: only preplaced blocks are immovable.
-        # Fixed-shape blocks may be repositioned (their w, h is already correct
-        # from the regression head).
+        # Post-placement legalization.
+        # Only preplaced blocks are immovable.
         positions = _legalize(positions, k, is_preplaced_orig)
 
         return positions

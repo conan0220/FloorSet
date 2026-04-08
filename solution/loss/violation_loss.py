@@ -100,16 +100,26 @@ def violation_loss(
     v_mib = (dist_mib * is_mib).sum() / is_mib.sum().clamp(min=1)
 
     # ── V_boundary ─────────────────────────────────────────────────
-    # Average gap penalty per boundary-constrained block.
+    # Penalise the gap between a boundary block's relevant edge and the
+    # canvas edge (0 or 1 in normalised space).  Using fixed canvas edges
+    # gives a stable training signal regardless of the predicted bounding
+    # box, which would otherwise be very small when boundary blocks are
+    # placed last in the autoregressive sequence.
+    #
+    # Bit layout (matches violation_loss convention):
+    #   bit 0 (1): left  → x_left  must touch x = 0
+    #   bit 1 (2): right → x_right must touch x = 1
+    #   bit 2 (4): bot   → y_bot   must touch y = 0
+    #   bit 3 (8): top   → y_top   must touch y = 1
     has_left  = (bcode & 1).float()                                       # [B, k]
     has_right = ((bcode >> 1) & 1).float()
     has_bot   = ((bcode >> 2) & 1).float()
     has_top   = ((bcode >> 3) & 1).float()
 
-    pen_left  = (x_left  - bbox_xmin.unsqueeze(1)).clamp(min=0) * has_left
-    pen_right = (bbox_xmax.unsqueeze(1) - x_right).clamp(min=0) * has_right
-    pen_bot   = (y_bot   - bbox_ymin.unsqueeze(1)).clamp(min=0) * has_bot
-    pen_top   = (bbox_ymax.unsqueeze(1) - y_top  ).clamp(min=0) * has_top
+    pen_left  = x_left.clamp(min=0)            * has_left   # gap from x = 0
+    pen_right = (1.0 - x_right).clamp(min=0)  * has_right  # gap from x = 1
+    pen_bot   = y_bot.clamp(min=0)             * has_bot    # gap from y = 0
+    pen_top   = (1.0 - y_top).clamp(min=0)    * has_top    # gap from y = 1
 
     n_boundary = (bcode > 0).float().sum().clamp(min=1)
     v_boundary = (pen_left + pen_right + pen_bot + pen_top).sum() / n_boundary

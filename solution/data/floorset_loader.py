@@ -85,7 +85,7 @@ def compute_canvas_ref(area_target: torch.Tensor, block_count: int) -> float:
 def sort_block_indices(constraints: torch.Tensor, block_count: int) -> torch.Tensor:
     """
     Return [k] tensor of original block indices sorted as:
-        preplaced → boundary → cluster → fixed → mib → normal
+        preplaced → cluster → fixed → mib → normal → boundary
 
     Each block falls into the FIRST matching category (priority order above).
     Within the cluster segment, blocks are sub-sorted by cluster_group ID
@@ -100,17 +100,17 @@ def sort_block_indices(constraints: torch.Tensor, block_count: int) -> torch.Ten
     cons = constraints[:block_count]   # [k, 5]
 
     is_preplaced = cons[:, 1].bool()
-    is_boundary  = (cons[:, 4] > 0) & ~is_preplaced
-    is_cluster   = (cons[:, 3] > 0) & ~is_preplaced & ~is_boundary
-    is_fixed     = cons[:, 0].bool()  & ~is_preplaced & ~is_boundary & ~is_cluster
-    is_mib       = (cons[:, 2] > 0)  & ~is_preplaced & ~is_boundary & ~is_cluster & ~is_fixed
-    is_normal    = ~(is_preplaced | is_boundary | is_cluster | is_fixed | is_mib)
+    is_cluster   = (cons[:, 3] > 0) & ~is_preplaced
+    is_fixed     = cons[:, 0].bool()  & ~is_preplaced & ~is_cluster
+    is_mib       = (cons[:, 2] > 0)  & ~is_preplaced & ~is_cluster & ~is_fixed
+    is_boundary  = (cons[:, 4] > 0)  & ~is_preplaced & ~is_cluster & ~is_fixed & ~is_mib
+    is_normal    = ~(is_preplaced | is_cluster | is_fixed | is_mib | is_boundary)
 
     pre_idx      = is_preplaced.nonzero(as_tuple=True)[0]
-    boundary_idx = is_boundary.nonzero(as_tuple=True)[0]
     fixed_idx    = is_fixed.nonzero(as_tuple=True)[0]
     mib_idx      = is_mib.nonzero(as_tuple=True)[0]
     normal_idx   = is_normal.nonzero(as_tuple=True)[0]
+    boundary_idx = is_boundary.nonzero(as_tuple=True)[0]
 
     # Cluster segment: sub-sort by group ID so same-group blocks are consecutive
     cluster_raw  = is_cluster.nonzero(as_tuple=True)[0]
@@ -119,7 +119,7 @@ def sort_block_indices(constraints: torch.Tensor, block_count: int) -> torch.Ten
     cluster_idx  = cluster_raw[order]
 
     return torch.cat([
-        pre_idx, boundary_idx, cluster_idx, fixed_idx, mib_idx, normal_idx,
+        pre_idx, cluster_idx, fixed_idx, mib_idx, normal_idx, boundary_idx,
     ])   # [k]
 
 

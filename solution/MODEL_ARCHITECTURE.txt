@@ -153,5 +153,3 @@ Loss Functions  (solution/loss/)
     v_mib           LAMBDA = 0.1    MIB block size deviation
     v_boundary      LAMBDA = 0.1    boundary constraint gap penalty
     v_overlap       LAMBDA = 50.0   pairwise overlap area / n_blocks
-  ratio_reg         LAMBDA = 2.0→0  log(w/h)² penalty, decays to 0 at epoch 20
-                                    (prevents degenerate thin-strip blocks)

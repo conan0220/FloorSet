@@ -516,10 +516,11 @@ class SimulatedAnnealingOptimizer(FloorplanOptimizer):
 class ContestEvaluator:
     """Main evaluation engine."""
     
-    def __init__(self, data_path: str = "../", verbose: bool = True):
+    def __init__(self, data_path: str = "../", verbose: bool = True, checkpoint: str = None):
         self.data_path = Path(data_path)
         self.verbose = verbose
         self.dataset = None
+        self._checkpoint = checkpoint
     
     def _load_dataset(self):
         if self.dataset is None:
@@ -529,29 +530,39 @@ class ContestEvaluator:
             if self.verbose:
                 print(f"Loaded {len(self.dataset)} validation cases")
     
-    def _load_optimizer(self, optimizer_path: str) -> FloorplanOptimizer:
+    def _load_optimizer(self, optimizer_path: str, checkpoint: str = None) -> FloorplanOptimizer:
         """Load optimizer from file."""
         path = Path(optimizer_path)
         if not path.exists():
             raise FileNotFoundError(f"Optimizer file not found: {optimizer_path}")
-        
+
         spec = importlib.util.spec_from_file_location("optimizer_module", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        
+
+        kwargs = {"verbose": self.verbose}
+        if checkpoint is not None:
+            kwargs["checkpoint"] = checkpoint
+
         # Find optimizer class
         for name in dir(module):
             obj = getattr(module, name)
-            if (isinstance(obj, type) and 
-                issubclass(obj, FloorplanOptimizer) and 
+            if (isinstance(obj, type) and
+                issubclass(obj, FloorplanOptimizer) and
                 obj is not FloorplanOptimizer):
-                return obj(verbose=self.verbose)
-        
+                try:
+                    return obj(**kwargs)
+                except TypeError:
+                    return obj(verbose=self.verbose)
+
         # Try common names
         for name in ['MyOptimizer', 'Optimizer', 'ContestOptimizer']:
             if hasattr(module, name):
-                return getattr(module, name)(verbose=self.verbose)
-        
+                try:
+                    return getattr(module, name)(**kwargs)
+                except TypeError:
+                    return getattr(module, name)(verbose=self.verbose)
+
         raise ValueError(f"No optimizer class found in {optimizer_path}")
     
     def _extract_baseline(self, idx, labels, b2b_conn, p2b_conn, pins_pos, block_count):
@@ -591,7 +602,7 @@ class ContestEvaluator:
     ) -> EvaluationResult:
         """Run full evaluation."""
         self._load_dataset()
-        optimizer = self._load_optimizer(optimizer_path)
+        optimizer = self._load_optimizer(optimizer_path, checkpoint=getattr(self, '_checkpoint', None))
         
         if test_ids is None:
             test_ids = list(range(len(self.dataset)))
@@ -1583,6 +1594,9 @@ def main():
                        help='Print per-block (x, y, w, h) for each test case')
     parser.add_argument('--viz', action='store_true',
                        help='Save floorplan visualizations (default: off)')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                       help='Checkpoint filename to load (e.g. best.pt, latest.pt); '
+                            'default: best.pt → latest.pt')
 
     args = parser.parse_args()
 
@@ -1591,7 +1605,7 @@ def main():
         return
 
     if args.evaluate:
-        evaluator = ContestEvaluator(args.data_path, verbose=True)
+        evaluator = ContestEvaluator(args.data_path, verbose=True, checkpoint=args.checkpoint)
         test_ids = [args.test_id] if args.test_id is not None else None
 
         if args.viz:

@@ -32,7 +32,6 @@ from config import (
     VALIDATE_EVERY, VIZ_BLOCK_SIZES, RAW_FEATURE_DIM,
     LOGS_DIR, CHECKPOINT_DIR, CONTEST_DIR,
     CACHE_DIR, CACHE_PRELOAD,
-    LAMBDA_RATIO_REG, RATIO_REG_DECAY_EPOCHS,
 )
 from data.floorset_loader import (
     preprocess_sample,
@@ -166,11 +165,6 @@ def make_lr_lambda(warmup_steps: int, total_steps: int):
 # Loss computation
 # =============================================================================
 
-def ratio_reg_weight(epoch: int) -> float:
-    """Linear decay: LAMBDA_RATIO_REG at epoch 0 → 0 at RATIO_REG_DECAY_EPOCHS."""
-    if epoch >= RATIO_REG_DECAY_EPOCHS:
-        return 0.0
-    return LAMBDA_RATIO_REG * (1.0 - epoch / RATIO_REG_DECAY_EPOCHS)
 
 
 def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0):
@@ -213,26 +207,12 @@ def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0)
     l_area  = area_loss(pred_raw, abase)
     l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
 
-    # Ratio regularisation: penalise log(w/h)² on valid (non-padded) blocks.
-    # Weight decays linearly to 0 over RATIO_REG_DECAY_EPOCHS so physical losses
-    # gradually take full control of block shape.
-    lam_ratio = ratio_reg_weight(epoch)
-    if lam_ratio > 0:
-        pred_w = pred_norm[..., 2].clamp(min=1e-8)   # [B, k]
-        pred_h = pred_norm[..., 3].clamp(min=1e-8)   # [B, k]
-        log_ratio = torch.log(pred_w / pred_h)        # [B, k]
-        valid_2d  = valid.squeeze(-1)                 # [B, k]
-        l_ratio_reg = (log_ratio.pow(2) * valid_2d).sum() / valid_2d.sum().clamp(min=1)
-    else:
-        l_ratio_reg = pred_norm.new_zeros(1).squeeze()
-
     total = (LAMBDA_WIRELENGTH * l_wl
              + LAMBDA_AREA       * l_area
              + LAMBDA_GROUPING   * l_grouping
              + LAMBDA_MIB        * l_mib
              + LAMBDA_BOUNDARY   * l_boundary
-             + LAMBDA_OVERLAP    * l_overlap
-             + lam_ratio         * l_ratio_reg)
+             + LAMBDA_OVERLAP    * l_overlap)
 
     return total, {
         "total":      total.item(),
@@ -242,8 +222,6 @@ def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0)
         "mib":        l_mib.item(),
         "boundary":   l_boundary.item(),
         "overlap":    l_overlap.item(),
-        "ratio_reg":  l_ratio_reg.item(),
-        "lam_ratio":  lam_ratio,
     }, pred_norm
 
 
@@ -304,12 +282,8 @@ def validate_with_solve(
     dry_run:    bool = False,
 ) -> float:
     """
-    Run the official ICCAD evaluator as a subprocess and return Avg Cost.
-
-    Always evaluates the CURRENT model weights by temporarily writing them to
-    best.pt (which my_optimizer.py prefers over latest.pt).  If the score does
-    not improve, the previous best.pt is restored from a backup so that the
-    on-disk best.pt always reflects the truly best model.
+    Run evaluate_detail.py as a subprocess with --checkpoint latest.pt
+    and return Avg Cost.  No best.pt manipulation needed.
 
     Lower score is better (feasible solutions have cost < 10.0).
     Returns float("inf") on failure.
@@ -318,31 +292,24 @@ def validate_with_solve(
         print(f"  [smoke-test] official-val epoch={epoch} — skipped")
         return float("inf")
 
-    import shutil
     import subprocess
 
-    best_ck   = CHECKPOINT_DIR / "best.pt"
-    backup_ck = CHECKPOINT_DIR / "_best_backup.pt"
-
-    # --- back up existing best.pt, then write current model as best.pt ---
-    if best_ck.exists():
-        shutil.copy2(best_ck, backup_ck)
-    save_checkpoint(model, optimizer_state, epoch, epoch_losses,
-                    best_score, best_ck)
-
-    evaluator = _REPO_ROOT / "iccad2026contest" / "iccad2026_evaluate.py"
+    latest_ck  = CHECKPOINT_DIR / "latest.pt"
+    evaluator  = _REPO_ROOT / "iccad2026contest" / "evaluate_detail.py"
     opt_script = _REPO_ROOT / "iccad2026contest" / "my_optimizer.py"
-    cmd = [sys.executable, str(evaluator), "--evaluate", str(opt_script)]
-    print(f"  [val] epoch={epoch}  running official evaluator …")
+    cmd = [
+        sys.executable, str(evaluator),
+        "--evaluate", str(opt_script),
+        "--checkpoint", str(latest_ck),
+    ]
+    print(f"  [val] epoch={epoch}  running evaluator …")
 
-    # Stream subprocess output to terminal in real-time while also collecting
-    # it for later parsing.
     lines = []
     try:
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,   # merge stderr into stdout
+            stderr=subprocess.STDOUT,
             text=True,
             cwd=str(_REPO_ROOT / "iccad2026contest"),
         )
@@ -354,48 +321,40 @@ def validate_with_solve(
     except subprocess.TimeoutExpired:
         proc.kill()
         print("  [val] evaluator timed out — skipping")
-        _restore_best_backup(best_ck, backup_ck)
         return float("inf")
     except Exception as e:
         print(f"  [val] evaluator error: {e} — skipping")
-        _restore_best_backup(best_ck, backup_ck)
         return float("inf")
 
-    # Parse "Avg Cost: X.XXXX"
-    avg_cost = float("inf")
+    # Parse "Total Score: X.XXXX"
+    total_score = float("inf")
+    avg_cost    = float("inf")
     for line in stdout.splitlines():
-        if line.strip().startswith("Avg Cost:"):
+        s = line.strip()
+        if s.startswith("Total Score:"):
             try:
-                avg_cost = float(line.split(":")[1].strip())
+                total_score = float(s.split(":")[1].strip())
             except ValueError:
                 pass
-            break
+        elif s.startswith("Avg Cost:"):
+            try:
+                avg_cost = float(s.split(":")[1].strip())
+            except ValueError:
+                pass
 
-    if avg_cost == float("inf"):
-        print("  [val] could not parse Avg Cost from evaluator output")
-        if result.returncode != 0:
-            print(f"  [val] stderr: {result.stderr[-500:]}")
-        _restore_best_backup(best_ck, backup_ck)
+    if total_score == float("inf"):
+        print("  [val] could not parse Total Score from evaluator output")
     else:
-        print(f"  [val] epoch={epoch}  Avg Cost={avg_cost:.4f}")
-        if avg_cost >= best_score and backup_ck.exists():
-            # Current model did not improve — restore previous best
-            shutil.copy2(backup_ck, best_ck)
-        if backup_ck.exists():
-            backup_ck.unlink()
+        print(f"  [val] epoch={epoch}  Total Score={total_score:.4f}  Avg Cost={avg_cost:.4f}")
+        if total_score < best_score:
+            save_checkpoint(model, optimizer_state, epoch, epoch_losses,
+                            total_score, CHECKPOINT_DIR / "best.pt")
+            print(f"  [val] best.pt updated (total_score {total_score:.4f})")
 
     with open(log_file, "a") as f:
-        f.write(f"Epoch {epoch}: Avg Cost={avg_cost:.4f}\n")
+        f.write(f"Epoch {epoch}: Total Score={total_score:.4f}  Avg Cost={avg_cost:.4f}\n")
 
-    return avg_cost
-
-
-def _restore_best_backup(best_ck: Path, backup_ck: Path):
-    """Restore best.pt from backup if backup exists."""
-    import shutil
-    if backup_ck.exists():
-        shutil.copy2(backup_ck, best_ck)
-        backup_ck.unlink()
+    return total_score
 
 
 # =============================================================================
@@ -617,7 +576,6 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
                       f"  mib={loss_parts['mib']:.4f}"
                       f"  bnd={loss_parts['boundary']:.4f}"
                       f"  ovlp={loss_parts['overlap']:.4f}"
-                      f"  ratio_reg={loss_parts['ratio_reg']:.4f}(×{loss_parts['lam_ratio']:.2f})"
                       f"  lr={lr_now:.2e}")
 
         # ── Epoch-end logging ─────────────────────────────────────────────

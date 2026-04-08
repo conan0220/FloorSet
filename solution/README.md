@@ -147,7 +147,6 @@ preplaced → boundary → cluster（依 group ID 排列）→ fixed-shape → m
 | `V_grouping` | 0.1 | Cluster 群心距離懲罰 |
 | `V_mib` | 0.1 | MIB 尺寸偏差 |
 | `V_boundary` | 0.1 | Boundary 擺放間距懲罰 |
-| `L_ratio_reg` | 2.0→0 | log(w/h)² 正則化（前 20 epoch 線性衰減至 0）|
 
 ---
 

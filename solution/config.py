@@ -88,12 +88,6 @@ LAMBDA_MIB        = 0.1     # weight for V_mib       (macro-in-block size deviat
 LAMBDA_BOUNDARY   = 0.1     # weight for V_boundary  (boundary gap penalty)
 LAMBDA_OVERLAP    = 50.0    # weight for V_overlap   (pairwise overlap area)
 
-# Ratio regularisation: penalise log(w/h)² to prevent degenerate thin-strip blocks.
-# Weight decays linearly from LAMBDA_RATIO_REG → 0 over RATIO_REG_DECAY_EPOCHS epochs,
-# then stays at 0 so physical losses fully take over.
-LAMBDA_RATIO_REG        = 2.0   # initial weight (epoch 0)
-RATIO_REG_DECAY_EPOCHS  = 20    # number of epochs to reach 0
-
 # Aspect ratio (w/h) hard clamp in ContinuousRegressionHead
 MIN_RATIO = 0.2   # w/h lower bound (block at most 5× taller than wide)
 MAX_RATIO = 5.0   # w/h upper bound (block at most 5× wider than tall)

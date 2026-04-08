@@ -8,8 +8,6 @@ Usage:
 
 import argparse
 import math
-import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -17,7 +15,6 @@ import matplotlib
 matplotlib.use("Agg")
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import torch
 import torch.nn as nn
 
@@ -30,9 +27,10 @@ sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
 
 from config import (
     BATCH_SIZE, MAX_EPOCHS, PATIENCE, LEARNING_RATE, WARMUP_STEPS,
-    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION,
+    GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA,
+    LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
     VALIDATE_EVERY, VIZ_BLOCK_SIZES, RAW_FEATURE_DIM,
-    LOGS_DIR, VIZ_DIR, CHECKPOINT_DIR, CONTEST_DIR,
+    LOGS_DIR, CHECKPOINT_DIR, CONTEST_DIR,
     CACHE_DIR, CACHE_PRELOAD,
 )
 from data.floorset_loader import (
@@ -46,10 +44,10 @@ from data.floorset_loader import (
     build_sort_inv,
 )
 from model.transformer_floorplan import TransformerFloorplan
-from loss.coord_loss      import coord_loss
 from loss.wirelength_loss import wirelength_loss
 from loss.area_loss       import area_loss
 from loss.violation_loss  import violation_loss
+from inference            import ar_inference
 
 
 # =============================================================================
@@ -57,7 +55,7 @@ from loss.violation_loss  import violation_loss
 # =============================================================================
 
 def _make_dirs():
-    for d in (LOGS_DIR, VIZ_DIR, CHECKPOINT_DIR):
+    for d in (LOGS_DIR, CHECKPOINT_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -167,13 +165,16 @@ def make_lr_lambda(warmup_steps: int, total_steps: int):
 # Loss computation
 # =============================================================================
 
-def compute_batch_loss(model, batch: dict, device: torch.device):
+
+
+def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0):
     """
-    Forward pass + compute all four loss terms.
+    Forward pass + compute all loss terms.
 
     Returns:
         total_loss  (scalar, differentiable)
         dict of individual scalar .item() values for logging
+        pred_norm   [B, k, 4] for external use
     """
     tf   = batch["token_features"].to(device)
     wi   = batch["w_int"].to(device)
@@ -187,13 +188,13 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
     hbase = batch["hpwl_baselines"].to(device) # [B]
     abase = batch["area_baselines"].to(device) # [B]
 
-    # Forward (teacher forcing)
+    # Forward (teacher forcing) → pred_norm [B, k, 4]
     pred_norm = model(
         tf, wi,
         gt_positions=gtn,
         key_padding_mask=kpm,
         teacher_forcing=True,
-    )                                          # [B, k, 4]
+    )
 
     # Zero out padded positions so they don't contribute to losses
     valid = (~kpm).float().unsqueeze(-1)       # [B, k, 1]
@@ -202,22 +203,25 @@ def compute_batch_loss(model, batch: dict, device: torch.device):
     # De-normalise for HPWL / area losses (raw pixel scale)
     pred_raw = pred_norm * crefs.view(-1, 1, 1)  # [B, k, 4]
 
-    l_coord = coord_loss(pred_norm, gtn, cons)
     l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
     l_area  = area_loss(pred_raw, abase)
-    l_viol  = violation_loss(pred_norm, cons)
+    l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
 
-    total = (l_coord
-             + LAMBDA_WIRELENGTH * l_wl
+    total = (LAMBDA_WIRELENGTH * l_wl
              + LAMBDA_AREA       * l_area
-             + LAMBDA_VIOLATION  * l_viol)
+             + LAMBDA_GROUPING   * l_grouping
+             + LAMBDA_MIB        * l_mib
+             + LAMBDA_BOUNDARY   * l_boundary
+             + LAMBDA_OVERLAP    * l_overlap)
 
     return total, {
         "total":      total.item(),
-        "coord":      l_coord.item(),
         "wirelength": l_wl.item(),
         "area":       l_area.item(),
-        "violation":  l_viol.item(),
+        "grouping":   l_grouping.item(),
+        "mib":        l_mib.item(),
+        "boundary":   l_boundary.item(),
+        "overlap":    l_overlap.item(),
     }, pred_norm
 
 
@@ -268,50 +272,89 @@ def update_loss_plot(epoch_losses: list, save_path: Path):
 # Official validation (subprocess)
 # =============================================================================
 
-def run_official_validation(epoch: int, log_file: Path, dry_run: bool = False) -> float:
+def validate_with_solve(
+    model,
+    optimizer_state,
+    epoch:      int,
+    epoch_losses: list,
+    best_score: float,
+    log_file:   Path,
+    dry_run:    bool = False,
+) -> float:
     """
-    Run the official evaluator as a subprocess.
-    Prints output to terminal and appends to log_file.
-    Returns the parsed Total Score (lower is better), or inf on failure.
-    """
-    header = f"========== Epoch {epoch} =========="
-    print(header)
+    Run evaluate_detail.py as a subprocess with --checkpoint latest.pt
+    and return Avg Cost.  No best.pt manipulation needed.
 
+    Lower score is better (feasible solutions have cost < 10.0).
+    Returns float("inf") on failure.
+    """
     if dry_run:
-        msg = "[smoke-test] Skipping official evaluator — dry run.\n"
-        print(msg)
-        with open(log_file, "a") as f:
-            f.write(header + "\n" + msg + "\n")
+        print(f"  [smoke-test] official-val epoch={epoch} — skipped")
         return float("inf")
 
+    import subprocess
+
+    latest_ck  = CHECKPOINT_DIR / "latest.pt"
+    evaluator  = _REPO_ROOT / "iccad2026contest" / "evaluate_detail.py"
+    opt_script = _REPO_ROOT / "iccad2026contest" / "my_optimizer.py"
     cmd = [
-        sys.executable,
-        str(CONTEST_DIR / "iccad2026_evaluate.py"),
-        "--evaluate",
-        str(CONTEST_DIR / "my_optimizer.py")
+        sys.executable, str(evaluator),
+        "--evaluate", str(opt_script),
+        "--checkpoint", str(latest_ck),
     ]
+    print(f"  [val] epoch={epoch}  running evaluator …")
+
+    lines = []
     try:
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, cwd=str(_REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(_REPO_ROOT / "iccad2026contest"),
         )
-        lines = []
         for line in proc.stdout:
             print(line, end="", flush=True)
             lines.append(line)
-        proc.wait()
-        output = "".join(lines)
+        proc.wait(timeout=600)
+        stdout = "".join(lines)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        print("  [val] evaluator timed out — skipping")
+        return float("inf")
     except Exception as e:
-        output = f"[ERROR] Failed to run evaluator: {e}\n"
-        print(output, end="")
+        print(f"  [val] evaluator error: {e} — skipping")
+        return float("inf")
+
+    # Parse "Total Score: X.XXXX"
+    total_score = float("inf")
+    avg_cost    = float("inf")
+    for line in stdout.splitlines():
+        s = line.strip()
+        if s.startswith("Total Score:"):
+            try:
+                total_score = float(s.split(":")[1].strip())
+            except ValueError:
+                pass
+        elif s.startswith("Avg Cost:"):
+            try:
+                avg_cost = float(s.split(":")[1].strip())
+            except ValueError:
+                pass
+
+    if total_score == float("inf"):
+        print("  [val] could not parse Total Score from evaluator output")
+    else:
+        print(f"  [val] epoch={epoch}  Total Score={total_score:.4f}  Avg Cost={avg_cost:.4f}")
+        if total_score < best_score:
+            save_checkpoint(model, optimizer_state, epoch, epoch_losses,
+                            total_score, CHECKPOINT_DIR / "best.pt")
+            print(f"  [val] best.pt updated (total_score {total_score:.4f})")
 
     with open(log_file, "a") as f:
-        f.write(header + "\n" + output + "\n")
+        f.write(f"Epoch {epoch}: Total Score={total_score:.4f}  Avg Cost={avg_cost:.4f}\n")
 
-    # Parse Total Score from evaluator output
-    match = re.search(r"Total Score:\s*([\d.]+)", output)
-    return float(match.group(1)) if match else float("inf")
+    return total_score
 
 
 # =============================================================================
@@ -369,196 +412,34 @@ def _compute_viz_loss(s: dict, pred_norm: torch.Tensor, device) -> dict:
 
     pred_raw = pred_norm * ref   # [1, k, 4]
 
+    kpm_viz = torch.zeros(1, k, dtype=torch.bool, device=device)
+
     with torch.no_grad():
-        l_coord = coord_loss(pred_norm, gtn, cons).item()
         l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase).item()
         l_area  = area_loss(pred_raw, abase).item()
-        l_viol  = violation_loss(pred_norm, cons).item()
-        total   = (l_coord
-                   + LAMBDA_WIRELENGTH * l_wl
-                   + LAMBDA_AREA       * l_area
-                   + LAMBDA_VIOLATION  * l_viol)
+        l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
+        l_grouping  = l_grouping.item()
+        l_mib       = l_mib.item()
+        l_boundary  = l_boundary.item()
+        l_overlap   = l_overlap.item()
+        total = (LAMBDA_WIRELENGTH * l_wl
+                 + LAMBDA_AREA     * l_area
+                 + LAMBDA_GROUPING * l_grouping
+                 + LAMBDA_MIB      * l_mib
+                 + LAMBDA_BOUNDARY * l_boundary
+                 + LAMBDA_OVERLAP  * l_overlap)
 
     return {
         "total":      total,
-        "coord":      l_coord,
         "wirelength": l_wl,
         "area":       l_area,
-        "violation":  l_viol,
+        "grouping":   l_grouping,
+        "mib":        l_mib,
+        "boundary":   l_boundary,
+        "overlap":    l_overlap,
     }
 
 
-def _infer_and_save(model, s: dict, epoch: int, device, source: str, label: str):
-    """Run AR inference on one preprocessed sample dict, compute loss, save figure."""
-    k   = s["block_count"]
-    tf_ = s["token_features"][:k].unsqueeze(0).to(device)   # [1, k, 18]
-    wi_ = s["w_int"][:k, :k].unsqueeze(0).to(device)         # [1, k, k]
-
-    pred_norm = model(tf_, wi_, teacher_forcing=False)        # [1, k, 4]
-    pred_raw  = (pred_norm[0] * s["canvas_ref"]).cpu()        # [k, 4]
-    gt_raw    = s["gt_positions_raw"][:k]                     # [k, 4] sorted
-
-    loss_parts = _compute_viz_loss(s, pred_norm, device)
-    constraints = s["constraints_sorted"][:k].cpu()           # [k, 5]
-
-    _save_viz(gt_raw, pred_raw, epoch, k, source=source,
-              label=label, loss_parts=loss_parts, constraints=constraints)
-
-
-def visualize_predictions(
-    model:    nn.Module,
-    epoch:    int,
-    device:   torch.device,
-    dry_run:  bool = False,
-):
-    """
-    Saves GT-vs-Predicted figures for:
-      - 10 validation cases  (one per block size in VIZ_BLOCK_SIZES)
-      - 10 training cases    (evenly spaced from the first shard of the cache)
-    """
-    if dry_run:
-        print(f"  [smoke-test] viz epoch={epoch} — skipped (dry run)")
-        return
-
-    model.eval()
-    with torch.no_grad():
-
-        # ── Validation cases ──────────────────────────────────────────────
-        try:
-            from lite_dataset_test import FloorplanDatasetLiteTest
-            dataset = FloorplanDatasetLiteTest(str(_REPO_ROOT) + "/")
-        except ImportError:
-            print("[viz] FloorplanDatasetLiteTest not importable — skipping val viz.")
-            dataset = None
-
-        if dataset is not None:
-            for sz in VIZ_BLOCK_SIZES:
-                test_id = sz - 21
-                if test_id >= len(dataset):
-                    continue
-                sample = dataset[test_id]
-                inputs, labels = sample["input"], sample["label"]
-                area_target, b2b_conn, p2b_conn, pins_pos, constraints = inputs
-                polygons, val_metrics = labels
-
-                block_count = int((area_target != -1).sum().item())
-                fp_sol = _polygons_to_fp_sol(polygons, block_count)
-                fp_full = torch.zeros(area_target.shape[0], 4)
-                fp_full[:block_count] = fp_sol
-
-                s = preprocess_sample(
-                    area_target, b2b_conn, p2b_conn,
-                    pins_pos, constraints, fp_full, val_metrics,
-                )
-                _infer_and_save(model, s, epoch, device,
-                                source="val", label=f"case_{sz}")
-
-        # ── Training cases (from cache first shard) ───────────────────────
-        shard_path = CACHE_DIR / "shard_000000.pt"
-        if not shard_path.exists():
-            print("[viz] No cache shard found — skipping train viz.")
-            return
-
-        shard: list = torch.load(shard_path, weights_only=False)
-        n_train = min(10, len(shard))
-        step = max(1, len(shard) // n_train)
-        train_samples = [shard[i * step] for i in range(n_train)]
-
-        for idx, s in enumerate(train_samples):
-            _infer_and_save(model, s, epoch, device,
-                            source="train", label=f"sample_{idx:04d}")
-
-
-# Block type → (facecolor, legend label)
-_BLOCK_TYPE_COLORS = {
-    "mib":       ("mediumseagreen", "MIB"),
-    "cluster":   ("tomato",         "Cluster"),
-    "fixed":     ("violet",         "Fixed"),
-    "preplaced": ("slategray",      "Preplaced"),
-    "boundary":  ("goldenrod",      "Boundary"),
-    "default":   ("lightsteelblue", "Default"),
-}
-
-
-def _block_color(cons_row):
-    """Return (facecolor, label) for one block given its constraint row [5]."""
-    if cons_row[3] > 0:     # cluster
-        return _BLOCK_TYPE_COLORS["cluster"]
-    if cons_row[0] > 0:     # fixed
-        return _BLOCK_TYPE_COLORS["fixed"]
-    if cons_row[1] > 0:     # preplaced
-        return _BLOCK_TYPE_COLORS["preplaced"]
-    if cons_row[2] > 0:     # mib
-        return _BLOCK_TYPE_COLORS["mib"]
-    if cons_row[4] > 1:     # boundary
-        return _BLOCK_TYPE_COLORS["boundary"]
-    return _BLOCK_TYPE_COLORS["default"]
-
-
-def _save_viz(gt_raw, pred_raw, epoch: int, block_count: int,
-              source: str, label: str, loss_parts: dict,
-              constraints=None):
-    """
-    source      : "val" or "train"
-    label       : used in filename and title (e.g. "case_21" or "sample_0042")
-    loss_parts  : dict with keys total/coord/wirelength/area/violation/overlap
-    constraints : [k, 5] float tensor (optional); if provided, colors blocks by type
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-
-    # Build per-block colors from type (or fall back to tab20 by index)
-    if constraints is not None:
-        block_colors = [_block_color(constraints[i]) for i in range(block_count)]
-    else:
-        cm = plt.cm.tab20(range(block_count))
-        block_colors = [(cm[i % len(cm)], str(i)) for i in range(block_count)]
-
-    for ax, positions, title in [
-        (axes[0], gt_raw,   f"GT  ({block_count} blocks)"),
-        (axes[1], pred_raw, f"Pred ({block_count} blocks)"),
-    ]:
-        ax.set_title(title)
-        for i in range(block_count):
-            x, y, w, h = positions[i].tolist()
-            facecolor, _ = block_colors[i]
-            rect = mpatches.Rectangle(
-                (x, y), w, h,
-                linewidth=0.8, edgecolor="black",
-                facecolor=facecolor, alpha=0.7,
-            )
-            ax.add_patch(rect)
-        ax.autoscale()
-        ax.set_aspect("equal")
-        ax.set_xlabel("X"); ax.set_ylabel("Y")
-
-    # Type legend (only show types that appear in this sample)
-    if constraints is not None:
-        seen = {lbl: col for col, lbl in block_colors}
-        legend_patches = [
-            mpatches.Patch(facecolor=col, edgecolor="black", label=lbl)
-            for lbl, col in seen.items()
-        ]
-        axes[1].legend(handles=legend_patches, loc="upper right",
-                       fontsize=7, title="Block Type", title_fontsize=7)
-
-    fig.suptitle(f"Epoch {epoch} [{source}] {label}  ({block_count} blocks)")
-
-    loss_text = (
-        f"total={loss_parts['total']:.4f}  "
-        f"coord={loss_parts['coord']:.4f}  "
-        f"wl={loss_parts['wirelength']:.4f}  "
-        f"area={loss_parts['area']:.4f}  "
-        f"viol={loss_parts['violation']:.4f}"
-    )
-    fig.text(0.5, 0.01, loss_text, ha="center", va="bottom",
-             fontsize=8, family="monospace",
-             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
-
-    fig.tight_layout(rect=[0, 0.04, 1, 1])
-    out = VIZ_DIR / f"epoch_{epoch:03d}_{source}_{label}.png"
-    fig.savefig(out, dpi=120)
-    plt.close(fig)
-    print(f"  [viz] saved {out.name}")
 
 
 # =============================================================================
@@ -654,16 +535,18 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
 
             # Forward + backward
             optimizer.zero_grad()
-            loss, loss_parts, pred_norm_ = compute_batch_loss(model, batch, device)
+            loss, loss_parts, pred_norm_ = compute_batch_loss(model, batch, device, epoch=epoch)
 
             if not torch.isfinite(loss):
                 lr_now = scheduler.get_last_lr()[0]
                 p = pred_norm_.detach().float()
                 print(f"  [warn] non-finite loss at epoch={epoch} step={batch_idx}")
-                print(f"    coord      = {loss_parts['coord']}")
                 print(f"    wirelength = {loss_parts['wirelength']}")
                 print(f"    area       = {loss_parts['area']}")
-                print(f"    violation  = {loss_parts['violation']}")
+                print(f"    grouping   = {loss_parts['grouping']}")
+                print(f"    mib        = {loss_parts['mib']}")
+                print(f"    boundary   = {loss_parts['boundary']}")
+                print(f"    overlap    = {loss_parts['overlap']}")
                 print(f"    total      = {loss_parts['total']}")
                 print(f"    pred min/max/mean = {p.min().item():.4e} / {p.max().item():.4e} / {p.mean().item():.4e}"
                       f"  nan={torch.isnan(p).any().item()} inf={torch.isinf(p).any().item()}")
@@ -687,10 +570,12 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
             if smoke_test:
                 lr_now = scheduler.get_last_lr()[0]
                 print(f"  step={global_step}  loss={loss_parts['total']:.4f}"
-                      f"  coord={loss_parts['coord']:.4f}"
                       f"  wl={loss_parts['wirelength']:.4f}"
                       f"  area={loss_parts['area']:.4f}"
-                      f"  viol={loss_parts['violation']:.4f}"
+                      f"  grp={loss_parts['grouping']:.4f}"
+                      f"  mib={loss_parts['mib']:.4f}"
+                      f"  bnd={loss_parts['boundary']:.4f}"
+                      f"  ovlp={loss_parts['overlap']:.4f}"
                       f"  lr={lr_now:.2e}")
 
         # ── Epoch-end logging ─────────────────────────────────────────────
@@ -708,23 +593,22 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
 
         # ── Validation every N epochs ─────────────────────────────────────
         if epoch % validate_every == 0:
-            visualize_predictions(model, epoch, device, dry_run=smoke_test)
-            # score = run_official_validation(
-                # epoch, log_file, dry_run=smoke_test
-            # )
-            score = 10
-
+            score = validate_with_solve(
+                model, optimizer, epoch, epoch_losses,
+                best_score, log_file, dry_run=smoke_test,
+            )
+            # validate_with_solve writes current model to best.pt before
+            # evaluating, then restores the previous best.pt if no improvement.
+            # We only need to update best_score and the early-stop counter here.
             if score < best_score:
                 best_score = score
                 no_improve_count = 0
-                save_checkpoint(model, optimizer, epoch, epoch_losses,
-                                best_score, CHECKPOINT_DIR / "best.pt")
-                print(f"  → new best score: {best_score:.4f}, saved best.pt")
+                print(f"  → new best score: {best_score:.4f}, best.pt updated")
             else:
                 no_improve_count += 1
                 print(f"  → no improvement ({no_improve_count}/{patience_eff})")
 
-            # visualize_predictions(model, epoch, device, dry_run=smoke_test)
+
 
             if no_improve_count >= patience_eff:
                 print(f"Early stopping: no improvement for {patience_eff} validations.")

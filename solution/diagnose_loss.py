@@ -15,11 +15,11 @@ sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
 
 from config import (
-    LAMBDA_WIRELENGTH, LAMBDA_AREA, LAMBDA_VIOLATION,
+    LAMBDA_WIRELENGTH, LAMBDA_AREA,
+    LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
 )
 from data.floorset_loader import preprocess_sample, get_training_dataloader
 from model.transformer_floorplan import TransformerFloorplan
-from loss.coord_loss      import coord_loss
 from loss.wirelength_loss import wirelength_loss
 from loss.area_loss       import area_loss
 from loss.violation_loss  import violation_loss
@@ -98,20 +98,23 @@ def main():
     # ── Individual losses ──────────────────────────────────────────────────
     print("=== Loss components ===")
     with torch.no_grad():
-        l_coord = coord_loss(pred_norm, gtn, cons)
         l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
         l_area  = area_loss(pred_raw, abase)
-        l_viol  = violation_loss(pred_norm, gtn, cons)
+        l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
 
-    print(f"  coord      = {l_coord.item():+.6f}")
     print(f"  wirelength = {l_wl.item():+.6f}")
     print(f"  area       = {l_area.item():+.6f}")
-    print(f"  violation  = {l_viol.item():+.6f}")
+    print(f"  grouping   = {l_grouping.item():+.6f}")
+    print(f"  mib        = {l_mib.item():+.6f}")
+    print(f"  boundary   = {l_boundary.item():+.6f}")
+    print(f"  overlap    = {l_overlap.item():+.6f}")
 
-    total = (l_coord
-             + LAMBDA_WIRELENGTH * l_wl
-             + LAMBDA_AREA * l_area
-             + LAMBDA_VIOLATION * l_viol)
+    total = (LAMBDA_WIRELENGTH * l_wl
+             + LAMBDA_AREA       * l_area
+             + LAMBDA_GROUPING   * l_grouping
+             + LAMBDA_MIB        * l_mib
+             + LAMBDA_BOUNDARY   * l_boundary
+             + LAMBDA_OVERLAP    * l_overlap)
     print(f"  total      = {total.item():+.6f}")
     print(f"  total finite? {torch.isfinite(total).item()}")
 

@@ -1,0 +1,105 @@
+FloorSet Model Architecture Notes
+===================================
+
+整體流程
+--------
+token_features [B, k, 18]
+      |
+      v
+TokenFeatureProjection   → [B, k, d_model]
+      |
+      v
+Encoder（跑 1 次）        → [B, k, d_model]   enc_out（固定不變）
+      |
+      v
+Decoder + Head（跑 k 次，每次擺一個 block）
+      |
+      v
+pred_positions [B, k, 4]
+
+
+Encoder
+-------
+負責：讀懂整張圖紙，產生所有 block 的全局特徵。
+
+輸入：
+  - token_features（投影後）[B, k, d_model]
+  - w_int：block 之間的連結權重 [B, k, k]（netlist attention bias）
+  - key_padding_mask：padding 遮罩
+
+輸出：enc_out [B, k, d_model]
+
+特性：
+  - 只跑一次，結果供 Decoder 每步使用
+  - 透過 attention bias 讓相連的 block 互相影響
+
+
+Decoder
+-------
+負責：理解上下文，產生「思考結果」hidden state。
+
+輸入：
+  - enc_out（來自 Encoder，每步相同）
+  - 前幾步已擺好的位置 pred_pos（AR 模式）
+    - t=0：SOS token（可學習參數）
+    - t>0：coord_proj(pred_pos[t-1]) + block_id_embed(t-1)
+
+輸出：hidden state [B, 1, d_model]（抽象向量，不是座標）
+
+特性：
+  - 每個 block 跑一次，共跑 k 次
+  - 使用 causal mask，只能看到前面已擺的 block
+  - 本身不輸出座標，只輸出「思考結果」
+
+
+RegressionHead (DiscreteRegressionHead)
+----------------------------------------
+負責：把 hidden state 轉成具體座標。
+
+輸入：
+  - hidden state（來自 Decoder）[B, 1, d_model]
+  - token_features（當前 block 的屬性）[B, 1, 18]
+  - occupancy [B, G, G]（已佔用的格子，推理時使用）
+  - placed_blocks（精確的已放置 block 列表，推理時使用）
+
+計算流程：
+  1. shared MLP：hidden state → [B, hidden=64]
+  2. xy_head (Linear)：→ logits [B, G*G]（G=64，共 4096 個格子的分數）
+  3. ratio_head (Linear)：→ ratio（決定長寬比）
+  4. apply_occupancy_mask：把已佔用格子的 logits 設為 -inf
+  5. place_with_exact_check：從高分到低分依序嘗試，找第一個無重疊的格子
+     - 最多嘗試 max_retry=10 次
+     - 若全部重疊則 fallback（記錄 fallback_count）
+  6. 換算座標：x = (index % G) / G, y = (index // G) / G
+  7. 用 ratio 計算 w, h
+
+輸出：pred_positions [B, 1, 4]（x, y, w, h，正規化）
+
+
+重要限制
+--------
+- Transformer（Encoder + Decoder）本身不接收 occupancy，
+  對「哪些格子已被佔用」毫不知情。
+- occupancy 只在 RegressionHead 的後處理階段（apply_occupancy_mask）使用。
+- 因此模型產生的 logits 不考慮當前佈局，容易導致 overlap 和 fallback。
+- AR 模式雖然把 pred_pos 餵回 Decoder，但這是連續座標，
+  無法完整表達 occupancy 資訊。
+
+
+Fallback 問題分析
+-----------------
+fallback 發生原因：
+  logits 前 max_retry 名的候選格子全部與已放置 block 重疊。
+
+與 block 數量的關係（實測）：
+  21 blocks  → violation 11.5, fallback  0/21
+  25 blocks  → violation 12.0, fallback  1/25
+  30 blocks  → violation 16.5, fallback  7/30
+  50 blocks  → violation 18.4, fallback 10/50
+  101 blocks → violation 30.4, fallback 22/101
+
+violation 幾乎佔 total loss 的 95%+，是最主要的問題。
+
+提高 max_retry 的效果有限：
+  - retry 只是從現有 logits 中依序取次高分
+  - 模型沒學會分散預測，前幾十名都可能堆在同一區域

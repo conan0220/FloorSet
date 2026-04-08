@@ -22,7 +22,7 @@ SHARD_SIZE = 2000
 
 # Load entire cache into RAM at training startup (requires ~50 GB for 1 M samples).
 # Set True when RAM is sufficient; eliminates all disk I/O during training.
-CACHE_PRELOAD = True
+CACHE_PRELOAD = False
 
 # =============================================================================
 # Data
@@ -51,10 +51,13 @@ BOUNDARY_CODE_TO_IDX = {
 }
 BOUNDARY_DIM = 8  # one-hot dimensionality (0 → all-zero vector, no constraint)
 
+# Cluster group IDs in the dataset: 1, 2, 3, 4  (0 = no cluster)
+CLUSTER_DIM = 4   # one-hot dimensionality for cluster group
+
 # Raw token feature dimensionality before Linear projection:
 #   area_target(1) + block_type(3) + target_w/h(2) + target_x/y(2)
-#   + boundary_type(8) + is_mib(1) + is_cluster(1) = 18
-RAW_FEATURE_DIM = 18
+#   + boundary_type(8) + is_mib(1) + cluster_group_onehot(4) = 21
+RAW_FEATURE_DIM = 21
 
 # =============================================================================
 # Model Architecture
@@ -69,7 +72,7 @@ DROPOUT           = 0.1
 # =============================================================================
 # Training
 # =============================================================================
-BATCH_SIZE    = 64
+BATCH_SIZE    = 128
 MAX_EPOCHS    = 100
 PATIENCE      = 10          # early stopping patience (epochs)
 
@@ -80,10 +83,15 @@ GRAD_CLIP_NORM = 1.0
 # Loss weights
 LAMBDA_WIRELENGTH = 0.3     # weight for L_wirelength
 LAMBDA_AREA       = 0.3     # weight for L_area
-LAMBDA_VIOLATION  = 0.4     # weight for L_violation
+LAMBDA_GROUPING   = 0.1     # weight for V_grouping  (cluster centroid distance)
+LAMBDA_MIB        = 0.1     # weight for V_mib       (macro-in-block size deviation)
+LAMBDA_BOUNDARY   = 0.1     # weight for V_boundary  (boundary gap penalty)
+LAMBDA_OVERLAP    = 50.0    # weight for V_overlap   (pairwise overlap area)
 
-# Extra weight on preplaced blocks in L_coord
-PREPLACED_COORD_WEIGHT = 5.0
+# Aspect ratio (w/h) hard clamp in ContinuousRegressionHead
+MIN_RATIO = 0.2   # w/h lower bound (block at most 5× taller than wide)
+MAX_RATIO = 5.0   # w/h upper bound (block at most 5× wider than tall)
+
 
 # =============================================================================
 # Evaluation / Validation

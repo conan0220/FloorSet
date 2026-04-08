@@ -1,67 +1,36 @@
 """
-L_coord — grid-based coordinate cross-entropy loss.
+L_coord — continuous coordinate L1 loss.
 
-Converts GT (x, y) positions to grid indices (cell = floor(pos * G)),
-then computes cross-entropy against the predicted logits over G×G cells.
+Penalises the mean absolute error between predicted and GT (x, y) positions.
 
 Excluded from the loss:
   - Preplaced blocks  (position is hard-constrained, no need to learn)
   - Padding tokens    (key_padding_mask == True)
 """
 
-import sys
-from pathlib import Path
-
-import math
-
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import GRID_SIZE
-
 
 def coord_loss(
-    logits:           torch.Tensor,   # [B, k, G*G]
-    gt_positions_norm: torch.Tensor,  # [B, k, 4]  (x, y, w, h), normalised
-    constraints:      torch.Tensor,   # [B, k, 5]
-    key_padding_mask: torch.Tensor,   # [B, k] bool  (True = padding)
+    pred_positions_norm: torch.Tensor,  # [B, k, 4]  (x, y, w, h), normalised
+    gt_positions_norm:   torch.Tensor,  # [B, k, 4]
+    constraints:         torch.Tensor,  # [B, k, 5]
+    key_padding_mask:    torch.Tensor,  # [B, k] bool  (True = padding)
 ) -> torch.Tensor:
     """
-    Args:
-        logits            [B, k, G*G]  raw logits from DiscreteRegressionHead
-        gt_positions_norm [B, k, 4]   ground-truth (x, y, w, h), in [0, 1]
-        constraints       [B, k, 5]   col 1 = is_preplaced
-        key_padding_mask  [B, k]      True where the token is padding
-
-    Returns:
-        scalar cross-entropy loss (mean over valid tokens)
+    Returns scalar: mean L1 error on (x, y) over valid (non-preplaced, non-padding) blocks.
     """
-    B, k, G2 = logits.shape
-    G = int(round(G2 ** 0.5))
+    pred_xy = pred_positions_norm[..., :2]   # [B, k, 2]
+    gt_xy   = gt_positions_norm[..., :2]     # [B, k, 2]
 
-    # GT position → grid index  (row-major: index = gy * G + gx)
-    gt_x = gt_positions_norm[:, :, 0].clamp(0.0, 1.0 - 1e-6)   # [B, k]
-    gt_y = gt_positions_norm[:, :, 1].clamp(0.0, 1.0 - 1e-6)   # [B, k]
-    gx   = (gt_x * G).long().clamp(0, G - 1)                    # [B, k]
-    gy   = (gt_y * G).long().clamp(0, G - 1)                    # [B, k]
-    gt_index = (gy * G + gx)                                     # [B, k]
-
-    # Build validity mask: exclude preplaced and padding tokens
-    is_preplaced = constraints[:, :, 1] > 0   # [B, k]
-    valid        = ~(is_preplaced | key_padding_mask)             # [B, k]
+    is_preplaced = constraints[..., 1] > 0   # [B, k]
+    valid        = ~(is_preplaced | key_padding_mask)   # [B, k]
 
     if valid.sum() == 0:
-        return logits.sum() * 0.0   # differentiable zero
+        return pred_positions_norm.sum() * 0.0   # differentiable zero
 
-    valid_flat  = valid.view(B * k)               # [B*k]
-    logits_flat = logits.view(B * k, G2)          # [B*k, G*G]
-    gt_flat     = gt_index.view(B * k)            # [B*k]
-
-    # Normalise by maximum possible cross-entropy (uniform distribution over G*G cells)
-    # so the loss is in [0, 1] regardless of grid size.
-    ce = F.cross_entropy(logits_flat[valid_flat], gt_flat[valid_flat])
-    return ce / math.log(G * G)
+    return F.l1_loss(pred_xy[valid], gt_xy[valid])
 
 
 # =============================================================================
@@ -70,38 +39,44 @@ def coord_loss(
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("coord_loss.py  —  smoke test (cross-entropy)")
+    print("coord_loss.py  —  smoke test (L1)")
     print("=" * 55)
 
-    G = GRID_SIZE
     B, k = 2, 10
 
-    logits = torch.randn(B, k, G * G, requires_grad=True)
-    gt     = torch.rand(B, k, 4)   # normalised (x, y, w, h)
+    pred_norm = torch.rand(B, k, 4, requires_grad=True)
+    gt_norm   = torch.rand(B, k, 4)
 
     constraints = torch.zeros(B, k, 5)
-    constraints[:, :2, 1] = 1.0   # blocks 0-1 preplaced (excluded)
+    constraints[:, :2, 1] = 1.0   # blocks 0-1: preplaced (excluded)
 
     kpm = torch.zeros(B, k, dtype=torch.bool)
     kpm[:, -1] = True              # last token is padding (excluded)
 
-    loss = coord_loss(logits, gt, constraints, kpm)
+    loss = coord_loss(pred_norm, gt_norm, constraints, kpm)
 
-    print(f"\nlogits shape       : {tuple(logits.shape)}")
-    print(f"gt shape           : {tuple(gt.shape)}")
-    print(f"Loss value         : {loss.item():.6f}")
+    print(f"\npred_norm shape  : {tuple(pred_norm.shape)}")
+    print(f"gt_norm shape    : {tuple(gt_norm.shape)}")
+    print(f"Loss value       : {loss.item():.6f}")
     assert loss.ndim == 0, "Expected scalar"
-    assert loss.item() >= 0, "Cross-entropy must be non-negative"
+    assert loss.item() >= 0, "L1 must be non-negative"
 
     loss.backward()
-    assert logits.grad is not None, "No gradient to logits"
-    print(f"Gradient norm      : {logits.grad.norm().item():.6f}")
+    assert pred_norm.grad is not None, "No gradient to pred_norm"
+    print(f"Gradient norm    : {pred_norm.grad.norm().item():.6f}")
 
-    # All-preplaced + padding → dummy zero loss
-    kpm_all = torch.ones(B, k, dtype=torch.bool)
-    zero_loss = coord_loss(logits.detach(), gt, constraints, kpm_all)
-    print(f"All-excluded loss  : {zero_loss.item():.6f}  (expected 0)")
-    assert zero_loss.item() == 0.0
+    # Perfect prediction → loss = 0
+    zero_loss = coord_loss(
+        gt_norm.detach().requires_grad_(True), gt_norm, constraints, kpm
+    )
+    print(f"Perfect pred loss: {zero_loss.item():.2e}  (expected 0)")
+    assert zero_loss.item() < 1e-6
+
+    # All excluded → differentiable zero
+    kpm_all   = torch.ones(B, k, dtype=torch.bool)
+    zero_loss2 = coord_loss(pred_norm.detach(), gt_norm, constraints, kpm_all)
+    print(f"All-excluded loss: {zero_loss2.item():.6f}  (expected 0)")
+    assert zero_loss2.item() == 0.0
 
     print("\nSmoke test passed.")
     print("=" * 55)

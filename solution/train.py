@@ -28,7 +28,7 @@ sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
 from config import (
     BATCH_SIZE, MAX_EPOCHS, PATIENCE, LEARNING_RATE, WARMUP_STEPS,
     GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA,
-    LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
+    LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP, LAMBDA_COORD,
     VALIDATE_EVERY, VIZ_BLOCK_SIZES, RAW_FEATURE_DIM,
     LOGS_DIR, CHECKPOINT_DIR, CONTEST_DIR,
     CACHE_DIR, CACHE_PRELOAD,
@@ -48,6 +48,7 @@ from model.transformer_floorplan import TransformerFloorplan
 from loss.wirelength_loss import wirelength_loss
 from loss.area_loss       import area_loss
 from loss.violation_loss  import violation_loss
+from loss.coord_loss      import coord_loss
 from inference            import ar_inference
 
 
@@ -194,8 +195,8 @@ def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0)
     hbase = batch["hpwl_baselines"].to(device) # [B]
     abase = batch["area_baselines"].to(device) # [B]
 
-    # Forward (teacher forcing) → (pred_norm [B,k,4], logits [B,k,G*G])
-    pred_norm, logits = model(
+    # Forward (teacher forcing) → pred_norm [B, k, 4]
+    pred_norm = model(
         tf, wi,
         gt_positions=gtn,
         key_padding_mask=kpm,
@@ -209,6 +210,7 @@ def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0)
     # De-normalise for HPWL / area losses (raw pixel scale)
     pred_raw = pred_norm * crefs.view(-1, 1, 1)  # [B, k, 4]
 
+    l_coord = coord_loss(pred_norm, gtn, cons, kpm)
     l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
     l_area  = area_loss(pred_raw, abase)
     l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
@@ -226,7 +228,8 @@ def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0)
     else:
         l_ratio_reg = pred_norm.new_zeros(1).squeeze()
 
-    total = (LAMBDA_WIRELENGTH * l_wl
+    total = (LAMBDA_COORD       * l_coord
+             + LAMBDA_WIRELENGTH * l_wl
              + LAMBDA_AREA       * l_area
              + LAMBDA_GROUPING   * l_grouping
              + LAMBDA_MIB        * l_mib
@@ -236,6 +239,7 @@ def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0)
 
     return total, {
         "total":      total.item(),
+        "coord":      l_coord.item(),
         "wirelength": l_wl.item(),
         "area":       l_area.item(),
         "grouping":   l_grouping.item(),
@@ -296,60 +300,106 @@ def update_loss_plot(epoch_losses: list, save_path: Path):
 
 def validate_with_solve(
     model,
-    epoch:    int,
-    device:   torch.device,
-    log_file: Path,
-    n_samples: int = 10,
-    dry_run:  bool = False,
+    optimizer_state,
+    epoch:      int,
+    epoch_losses: list,
+    best_score: float,
+    log_file:   Path,
+    dry_run:    bool = False,
 ) -> float:
     """
-    Run AR inference (= solve core) on n_samples validation cases.
-    Returns average total loss across samples (lower is better).
+    Run the official ICCAD evaluator as a subprocess and return Avg Cost.
+
+    Always evaluates the CURRENT model weights by temporarily writing them to
+    best.pt (which my_optimizer.py prefers over latest.pt).  If the score does
+    not improve, the previous best.pt is restored from a backup so that the
+    on-disk best.pt always reflects the truly best model.
+
+    Lower score is better (feasible solutions have cost < 10.0).
+    Returns float("inf") on failure.
     """
     if dry_run:
-        print(f"  [smoke-test] solve-val epoch={epoch} — skipped")
+        print(f"  [smoke-test] official-val epoch={epoch} — skipped")
         return float("inf")
 
+    import shutil
+    import subprocess
+
+    best_ck   = CHECKPOINT_DIR / "best.pt"
+    backup_ck = CHECKPOINT_DIR / "_best_backup.pt"
+
+    # --- back up existing best.pt, then write current model as best.pt ---
+    if best_ck.exists():
+        shutil.copy2(best_ck, backup_ck)
+    save_checkpoint(model, optimizer_state, epoch, epoch_losses,
+                    best_score, best_ck)
+
+    evaluator = _REPO_ROOT / "iccad2026contest" / "iccad2026_evaluate.py"
+    opt_script = _REPO_ROOT / "iccad2026contest" / "my_optimizer.py"
+    cmd = [sys.executable, str(evaluator), "--evaluate", str(opt_script)]
+    print(f"  [val] epoch={epoch}  running official evaluator …")
+
+    # Stream subprocess output to terminal in real-time while also collecting
+    # it for later parsing.
+    lines = []
     try:
-        sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
-        from lite_dataset_test import FloorplanDatasetLiteTest
-        dataset = FloorplanDatasetLiteTest(str(_REPO_ROOT) + "/")
-    except ImportError:
-        print("[val] FloorplanDatasetLiteTest not importable — skipping solve-val")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,   # merge stderr into stdout
+            text=True,
+            cwd=str(_REPO_ROOT / "iccad2026contest"),
+        )
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            lines.append(line)
+        proc.wait(timeout=600)
+        stdout = "".join(lines)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        print("  [val] evaluator timed out — skipping")
+        _restore_best_backup(best_ck, backup_ck)
+        return float("inf")
+    except Exception as e:
+        print(f"  [val] evaluator error: {e} — skipping")
+        _restore_best_backup(best_ck, backup_ck)
         return float("inf")
 
-    model.eval()
-    losses = []
-    # Use the same block sizes as visualisation for consistency
-    cases = [sz for sz in VIZ_BLOCK_SIZES if sz - 21 < len(dataset)][:n_samples]
+    # Parse "Avg Cost: X.XXXX"
+    avg_cost = float("inf")
+    for line in stdout.splitlines():
+        if line.strip().startswith("Avg Cost:"):
+            try:
+                avg_cost = float(line.split(":")[1].strip())
+            except ValueError:
+                pass
+            break
 
-    with torch.no_grad():
-        for sz in cases:
-            idx = sz - 21
-            sample = dataset[idx]
-            inputs, labels = sample["input"], sample["label"]
-            area_target, b2b_conn, p2b_conn, pins_pos, constraints = inputs
-            polygons, val_metrics = labels
+    if avg_cost == float("inf"):
+        print("  [val] could not parse Avg Cost from evaluator output")
+        if result.returncode != 0:
+            print(f"  [val] stderr: {result.stderr[-500:]}")
+        _restore_best_backup(best_ck, backup_ck)
+    else:
+        print(f"  [val] epoch={epoch}  Avg Cost={avg_cost:.4f}")
+        if avg_cost >= best_score and backup_ck.exists():
+            # Current model did not improve — restore previous best
+            shutil.copy2(backup_ck, best_ck)
+        if backup_ck.exists():
+            backup_ck.unlink()
 
-            block_count = int((area_target != -1).sum().item())
-            fp_sol = _polygons_to_fp_sol(polygons, block_count)
-            fp_full = torch.zeros(area_target.shape[0], 4)
-            fp_full[:block_count] = fp_sol
-
-            s = preprocess_sample(
-                area_target, b2b_conn, p2b_conn,
-                pins_pos, constraints, fp_full, val_metrics,
-            )
-            pred_norm, _ = ar_inference(model, s, device)   # [1, k, 4]
-            lp = _compute_viz_loss(s, pred_norm, device)
-            losses.append(lp["total"])
-
-    avg = sum(losses) / len(losses) if losses else float("inf")
-    detail = "  ".join(f"{v:.4f}" for v in losses)
-    print(f"  [val] epoch={epoch}  avg={avg:.4f}  [{detail}]")
     with open(log_file, "a") as f:
-        f.write(f"Epoch {epoch}: avg={avg:.4f}  samples=[{detail}]\n")
-    return avg
+        f.write(f"Epoch {epoch}: Avg Cost={avg_cost:.4f}\n")
+
+    return avg_cost
+
+
+def _restore_best_backup(best_ck: Path, backup_ck: Path):
+    """Restore best.pt from backup if backup exists."""
+    import shutil
+    if backup_ck.exists():
+        shutil.copy2(backup_ck, best_ck)
+        backup_ck.unlink()
 
 
 # =============================================================================
@@ -590,15 +640,16 @@ def train(smoke_test: bool = False, num_shards: int | None = None):
         # ── Validation every N epochs ─────────────────────────────────────
         if epoch % validate_every == 0:
             score = validate_with_solve(
-                model, epoch, device, log_file, dry_run=smoke_test
+                model, optimizer, epoch, epoch_losses,
+                best_score, log_file, dry_run=smoke_test,
             )
-
+            # validate_with_solve writes current model to best.pt before
+            # evaluating, then restores the previous best.pt if no improvement.
+            # We only need to update best_score and the early-stop counter here.
             if score < best_score:
                 best_score = score
                 no_improve_count = 0
-                save_checkpoint(model, optimizer, epoch, epoch_losses,
-                                best_score, CHECKPOINT_DIR / "best.pt")
-                print(f"  → new best score: {best_score:.4f}, saved best.pt")
+                print(f"  → new best score: {best_score:.4f}, best.pt updated")
             else:
                 no_improve_count += 1
                 print(f"  → no improvement ({no_improve_count}/{patience_eff})")

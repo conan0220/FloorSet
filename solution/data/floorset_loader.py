@@ -85,21 +85,42 @@ def compute_canvas_ref(area_target: torch.Tensor, block_count: int) -> float:
 def sort_block_indices(constraints: torch.Tensor, block_count: int) -> torch.Tensor:
     """
     Return [k] tensor of original block indices sorted as:
-        preplaced → fixed-shape (non-preplaced) → soft
+        preplaced → boundary → cluster → fixed → mib → normal
+
+    Each block falls into the FIRST matching category (priority order above).
+    Within the cluster segment, blocks are sub-sorted by cluster_group ID
+    (1 → 2 → 3 → 4) so same-group blocks appear consecutively.
 
     constraints[:, 0] = is_fixed_shape
     constraints[:, 1] = is_preplaced
+    constraints[:, 2] = is_mib
+    constraints[:, 3] = cluster_group  (0 = none, 1-4 = group id)
+    constraints[:, 4] = boundary_type  (0 = none)
     """
-    cons = constraints[:block_count]          # [k, 5]
-    is_pre   = cons[:, 1].bool()
-    is_fixed = cons[:, 0].bool() & ~is_pre   # fixed-shape but not preplaced
-    is_soft  = ~(cons[:, 0].bool() | is_pre)
+    cons = constraints[:block_count]   # [k, 5]
 
-    pre_idx   = is_pre.nonzero(as_tuple=True)[0]
-    fixed_idx = is_fixed.nonzero(as_tuple=True)[0]
-    soft_idx  = is_soft.nonzero(as_tuple=True)[0]
+    is_preplaced = cons[:, 1].bool()
+    is_boundary  = (cons[:, 4] > 0) & ~is_preplaced
+    is_cluster   = (cons[:, 3] > 0) & ~is_preplaced & ~is_boundary
+    is_fixed     = cons[:, 0].bool()  & ~is_preplaced & ~is_boundary & ~is_cluster
+    is_mib       = (cons[:, 2] > 0)  & ~is_preplaced & ~is_boundary & ~is_cluster & ~is_fixed
+    is_normal    = ~(is_preplaced | is_boundary | is_cluster | is_fixed | is_mib)
 
-    return torch.cat([pre_idx, fixed_idx, soft_idx])   # [k]
+    pre_idx      = is_preplaced.nonzero(as_tuple=True)[0]
+    boundary_idx = is_boundary.nonzero(as_tuple=True)[0]
+    fixed_idx    = is_fixed.nonzero(as_tuple=True)[0]
+    mib_idx      = is_mib.nonzero(as_tuple=True)[0]
+    normal_idx   = is_normal.nonzero(as_tuple=True)[0]
+
+    # Cluster segment: sub-sort by group ID so same-group blocks are consecutive
+    cluster_raw  = is_cluster.nonzero(as_tuple=True)[0]
+    group_ids    = cons[cluster_raw, 3].long()
+    order        = torch.argsort(group_ids, stable=True)
+    cluster_idx  = cluster_raw[order]
+
+    return torch.cat([
+        pre_idx, boundary_idx, cluster_idx, fixed_idx, mib_idx, normal_idx,
+    ])   # [k]
 
 
 def build_sort_inv(sort_idx: torch.Tensor) -> torch.Tensor:

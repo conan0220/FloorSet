@@ -1,36 +1,34 @@
 """
-Discrete Regression Head.
+Continuous Regression Head.
 
-Maps Decoder hidden states to block placements using a G×G grid.
+Maps Decoder hidden states directly to continuous block placements (x, y, w, h).
 
 Architecture:
-    shared: Linear(d_model, hidden) → ReLU
-    xy_head:    Linear(hidden, G*G)   → logits over grid positions
-    ratio_head: Linear(hidden, 1)     → log_ratio (w/h)
+    shared:     Linear(d_model, hidden) → ReLU
+    xy_head:    Linear(hidden, 2)       → sigmoid → (x, y) ∈ [0, 1]
+    ratio_head: Linear(hidden + 2, 1)   → clamp log_ratio → ratio = w/h
 
-Post-processing:
-    grid cell (gx, gy) → x = gx/G, y = gy/G  (top-left corner, normalised)
-    ratio = exp(log_ratio)
-    w = sqrt(area_target_norm * ratio)
-    h = sqrt(area_target_norm / ratio)
+Size decoding (guarantees w * h == area_target):
+    ratio = exp(clamp(ratio_raw, log(MIN_RATIO), log(MAX_RATIO)))
+    w = sqrt(area_norm * ratio)
+    h = sqrt(area_norm / ratio)
 
-    For fixed-shape or preplaced blocks:
-        w, h overridden with target_w, target_h from token_features.
-    For preplaced blocks:
-        x, y overridden with target_x, target_y (grid prediction ignored).
+Overrides for fixed / preplaced blocks:
+    is_fixed or is_preplaced  → w, h replaced with target_w, target_h
+    is_preplaced              → x, y replaced with target_x, target_y
 
 forward() modes
 ───────────────
-occupancy=None  (training / teacher-forcing):
+placed_blocks=None  (training / teacher-forcing):
     x:              [B, k, d_model]
     token_features: [B, k, 21]
-    Returns: (pred_positions [B,k,4],  logits [B,k,G*G])
+    Returns: pred_positions [B, k, 4]
 
-occupancy=[B,G,G]  (autoregressive inference):
+placed_blocks=list  (autoregressive inference):
     x:              [B, 1, d_model]
-    token_features: [B, 1, 18]
-    Returns: pred_positions [B,1,4]
-    Side-effect: updates occupancy in-place with the newly placed block.
+    token_features: [B, 1, 21]
+    Returns: pred_positions [B, 1, 4]
+    Side-effect: appends newly placed block to each placed_blocks[b].
 
 Token feature layout (21 dims):
     [0]    area_target_norm
@@ -50,196 +48,145 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import D_MODEL, GRID_SIZE
+from config import D_MODEL, MIN_RATIO, MAX_RATIO
 
 
 # =============================================================================
-# Continuous-level exact overlap check
+# Non-overlap placement search
 # =============================================================================
 
-def place_with_exact_check(
-    logits,         # [G*G] float tensor — single sample, already masked (pass a .clone())
-    placed_blocks,  # list of (x_norm, y_norm, w_norm, h_norm) already placed
-    w_norm,         # float — current block normalised width
-    h_norm,         # float — current block normalised height
-    G,              # int   — grid size
-    max_retry=10,
+def _has_overlap(x: float, y: float, w: float, h: float, placed_blocks: list) -> bool:
+    # Use a tight threshold: touching blocks (overlap == 0) must not be flagged.
+    # 1e-9 filters genuine gaps while ignoring IEEE-754 rounding noise.
+    _TOL = 1e-9
+    for (px, py, pw, ph) in placed_blocks:
+        if (min(x + w, px + pw) - max(x, px) > _TOL and
+                min(y + h, py + ph) - max(y, py) > _TOL):
+            return True
+    return False
+
+
+def find_nonoverlap_position(
+    x_pred:       float,
+    y_pred:       float,
+    w:            float,
+    h:            float,
+    placed_blocks: list,   # list of (px, py, pw, ph) already placed
 ):
     """
-    Greedy placement with continuous-level exact overlap retry.
+    Find the position closest to (x_pred, y_pred) that does not overlap
+    any already-placed block.  Canvas boundary is not enforced — the model
+    is free to place blocks outside [0, 1] if needed.
 
-    Each attempt: argmax → check continuous overlap against placed_blocks.
-    If overlap: set that position to -inf and retry.
+    Uses boundary-candidate search: any feasible placement can be compacted
+    until x touches {0} ∪ {px_i + pw_i} and y touches {0} ∪ {py_i + ph_i},
+    so this set of candidates is guaranteed to contain a valid position
+    whenever any exists.
 
-    Returns: (x_norm, y_norm, is_fallback)
-      is_fallback=True when all max_retry attempts had overlap.
-      On fallback, returns the top-1 position (highest logit) so the model
-      receives gradient signal from the overlap penalty.
+    Returns: (x, y, is_fallback)
+        is_fallback=True only when no non-overlapping position was found
+        among all candidates (should not occur with infinite space).
     """
-    top1_index = None
-    last_index = None
+    # Candidate x-coordinates: origin + right edges of placed blocks.
+    # A small epsilon gap avoids IEEE-754 rounding artifacts that cause
+    # nominally-touching blocks to appear overlapping after de-normalisation
+    # (canvas_ref * 100-200 amplifies ~3.8e-6 normalised errors above the
+    # contest threshold of 1e-6 raw pixels).
+    _EPS = 1e-6
+    x_cands = [0.0] + [px + pw + _EPS for (px, py, pw, ph) in placed_blocks]
+    # Candidate y-coordinates: origin + top edges of placed blocks
+    y_cands = [0.0] + [py + ph + _EPS for (px, py, pw, ph) in placed_blocks]
 
-    for _ in range(max_retry):
-        if last_index is not None:
-            logits[last_index] = float('-inf')
+    # Also include the predicted position itself
+    x_cands.append(x_pred)
+    y_cands.append(y_pred)
 
-        if not torch.isfinite(logits).any():
-            break
+    # Sort all (x, y) pairs by Euclidean distance to predicted position
+    candidates = sorted(
+        [(x, y) for x in x_cands for y in y_cands],
+        key=lambda p: (p[0] - x_pred) ** 2 + (p[1] - y_pred) ** 2,
+    )
 
-        last_index = logits.argmax().item()
-        if top1_index is None:
-            top1_index = last_index   # remember the best candidate
+    for (x, y) in candidates:
+        if not _has_overlap(x, y, w, h, placed_blocks):
+            return x, y, False
 
-        x_norm = (last_index % G) / G
-        y_norm = (last_index // G) / G
-
-        overlap = False
-        for (px, py, pw, ph) in placed_blocks:
-            if (min(x_norm + w_norm, px + pw) - max(x_norm, px) > 0 and
-                    min(y_norm + h_norm, py + ph) - max(y_norm, py) > 0):
-                overlap = True
-                break
-
-        if not overlap:
-            return x_norm, y_norm, False
-
-    # Fallback: return top-1 position so v_overlap can penalise it
-    if top1_index is None:
-        top1_index = 0
-    return (top1_index % G) / G, (top1_index // G) / G, True
+    # Should not reach here — return predicted position as fallback
+    return x_pred, y_pred, True
 
 
-class DiscreteRegressionHead(nn.Module):
+# =============================================================================
+# ContinuousRegressionHead
+# =============================================================================
+
+class ContinuousRegressionHead(nn.Module):
     """
-    Grid-based regression head for floorplan placement.
+    Continuous regression head for floorplan placement.
+
+    Directly predicts (x, y) via sigmoid and ratio via a clamped linear
+    layer, then derives (w, h) from ratio and target area.
 
     Args:
-        d_model   (int): Input embedding dimension. Default: D_MODEL.
-        hidden    (int): Shared MLP hidden size.    Default: 64.
-        grid_size (int): Grid resolution (G).       Default: GRID_SIZE.
+        d_model   (int):   Input embedding dimension.  Default: D_MODEL.
+        hidden    (int):   Shared MLP hidden size.     Default: 64.
+        min_ratio (float): Minimum w/h ratio.          Default: MIN_RATIO.
+        max_ratio (float): Maximum w/h ratio.          Default: MAX_RATIO.
     """
 
     def __init__(
         self,
-        d_model:   int = D_MODEL,
-        hidden:    int = 64,
-        grid_size: int = GRID_SIZE,
+        d_model:   int   = D_MODEL,
+        hidden:    int   = 64,
+        min_ratio: float = MIN_RATIO,
+        max_ratio: float = MAX_RATIO,
     ):
         super().__init__()
-        self.G = grid_size
-        G = grid_size
-        self.shared     = nn.Sequential(nn.Linear(d_model, hidden), nn.ReLU())
-        self.xy_head    = nn.Linear(hidden, G * G)
-        self.ratio_head = nn.Linear(hidden + 2, 1)  # +2: conditioning on predicted (x, y)
-        self._fallback_count = 0   # reset by TransformerFloorplan before each AR pass
+        self._log_min = math.log(min_ratio)
+        self._log_max = math.log(max_ratio)
 
-        # Initialise ratio_head near-zero so ratio_raw ≈ 0 → ratio ≈ 1 → blocks start square.
-        # Without this, kaiming init can push ratio_raw far negative → degenerate thin strips.
+        self.shared     = nn.Sequential(nn.Linear(d_model, hidden), nn.ReLU())
+        self.xy_head    = nn.Linear(hidden, 2)         # → (x, y) before sigmoid
+        self.ratio_head = nn.Linear(hidden + 2, 1)     # +2: conditioned on (x, y)
+        self._fallback_count = 0
+
+        # Initialise ratio_head near-zero → ratio ≈ 1 (square) at init
         nn.init.xavier_uniform_(self.ratio_head.weight, gain=0.01)
         nn.init.zeros_(self.ratio_head.bias)
-
-        # Pre-computed grid cell coordinates for soft-argmax (training mode).
-        # cell_gx[i] = (i % G) / G  → normalised x of cell i
-        # cell_gy[i] = (i // G) / G → normalised y of cell i
-        indices = torch.arange(G * G)
-        self.register_buffer('cell_gx', (indices % G).float() / G)   # [G*G]
-        self.register_buffer('cell_gy', (indices // G).float() / G)  # [G*G]
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _decode_ratio(
+        self,
+        h:  torch.Tensor,  # [..., hidden]
+        x:  torch.Tensor,  # [...] normalised x
+        y:  torch.Tensor,  # [...] normalised y
+    ) -> torch.Tensor:
+        """Predict w/h ratio clamped to [MIN_RATIO, MAX_RATIO]."""
+        xy        = torch.stack([x, y], dim=-1)                      # [..., 2]
+        ratio_raw = self.ratio_head(torch.cat([h, xy], dim=-1))      # [..., 1]
+        log_ratio = ratio_raw.squeeze(-1).clamp(self._log_min, self._log_max)
+        return torch.exp(log_ratio)                                   # [...]
+
     def _decode_size(
         self,
-        token_features: torch.Tensor,  # [..., 18]
-        ratio_raw:      torch.Tensor,  # [..., 1]
+        token_features: torch.Tensor,  # [..., 21]
+        ratio:          torch.Tensor,  # [...]
     ):
-        """Compute (w, h) tensors with fixed-shape overrides."""
+        """Compute (w, h) from ratio + area, with fixed-shape overrides."""
         area_norm = token_features[..., 0].clamp(min=1e-12)
-        ratio     = torch.exp(ratio_raw.squeeze(-1))
         pred_w    = (area_norm * ratio).clamp(min=1e-8).sqrt()
         pred_h    = (area_norm / ratio.clamp(min=1e-8)).clamp(min=1e-8).sqrt()
 
         is_fixed     = token_features[..., 2]
         is_preplaced = token_features[..., 3]
         has_fixed    = (is_fixed + is_preplaced) > 0
-        target_w     = token_features[..., 4]
-        target_h     = token_features[..., 5]
-
-        pred_w = torch.where(has_fixed, target_w, pred_w)
-        pred_h = torch.where(has_fixed, target_h, pred_h)
+        pred_w = torch.where(has_fixed, token_features[..., 4], pred_w)
+        pred_h = torch.where(has_fixed, token_features[..., 5], pred_h)
         return pred_w, pred_h
-
-    def _build_positions(
-        self,
-        flat_idx:       torch.Tensor,  # [B, k] or [B, 1]
-        token_features: torch.Tensor,  # [B, k, 18] or [B, 1, 18]
-        ratio_raw:      torch.Tensor,  # [B, k, 1] or [B, 1, 1]
-    ) -> torch.Tensor:
-        """Convert flat grid indices to (x, y, w, h) with overrides."""
-        G  = self.G
-        gy = flat_idx // G
-        gx = flat_idx % G
-        x  = gx.float() / G
-        y  = gy.float() / G
-
-        pred_w, pred_h = self._decode_size(token_features, ratio_raw)
-
-        is_preplaced = token_features[..., 3] > 0
-        target_x     = token_features[..., 6]
-        target_y     = token_features[..., 7]
-        x = torch.where(is_preplaced, target_x, x)
-        y = torch.where(is_preplaced, target_y, y)
-
-        return torch.stack([x, y, pred_w, pred_h], dim=-1)
-
-    def apply_occupancy_mask(
-        self,
-        logits:         torch.Tensor,  # [B, G*G]
-        token_features: torch.Tensor,  # [B, 18]
-        occupancy:      torch.Tensor,  # [B, G, G]
-    ) -> torch.Tensor:
-        """
-        Set logits to -inf at positions where the block would overlap
-        already-placed blocks.  Uses F.conv2d on the occupancy map.
-        Returns: [B, G*G]
-        """
-        G      = self.G
-        B      = logits.shape[0]
-        device = logits.device
-
-        # Estimate block footprint for masking (use ratio=1 approximation)
-        area_norm = token_features[:, 0].clamp(min=1e-12)
-        w_approx  = area_norm.sqrt()
-        h_approx  = w_approx.clone()
-        is_fixed     = token_features[:, 2]
-        is_preplaced = token_features[:, 3]
-        has_fixed    = (is_fixed + is_preplaced) > 0
-        w_approx = torch.where(has_fixed, token_features[:, 4], w_approx)
-        h_approx = torch.where(has_fixed, token_features[:, 5], h_approx)
-
-        masked = logits.clone()
-        for b in range(B):
-            w_cells = max(1, min(G, int(math.ceil(w_approx[b].item() * G))))
-            h_cells = max(1, min(G, int(math.ceil(h_approx[b].item() * G))))
-
-            occ    = occupancy[b].unsqueeze(0).unsqueeze(0)              # [1,1,G,G]
-            kernel = torch.ones(1, 1, h_cells, w_cells, device=device)
-            conv   = F.conv2d(occ, kernel, padding=0)                    # [1,1,gh,gw]
-
-            gh = G - h_cells + 1
-            gw = G - w_cells + 1
-
-            valid_mask = torch.zeros(G, G, dtype=torch.bool, device=device)
-            if gh > 0 and gw > 0:
-                valid_mask[:gh, :gw] = conv[0, 0] == 0
-
-            masked[b] = masked[b].masked_fill(~valid_mask.view(G * G), float('-inf'))
-
-        return masked
 
     # ------------------------------------------------------------------
     # Forward
@@ -247,130 +194,75 @@ class DiscreteRegressionHead(nn.Module):
 
     def forward(
         self,
-        x:              torch.Tensor,          # [B, k, d_model] or [B, 1, d_model]
-        token_features: torch.Tensor,          # [B, k, 18]      or [B, 1, 18]
-        occupancy:      torch.Tensor = None,   # [B, G, G]  — inference only
-        placed_blocks:  list         = None,   # list[list[tuple]] — inference only
+        x:              torch.Tensor,        # [B, k, d_model] or [B, 1, d_model]
+        token_features: torch.Tensor,        # [B, k, 21]      or [B, 1, 21]
+        placed_blocks:  list = None,         # list[list[tuple]] — inference only
     ):
         """
-        Training (occupancy=None):
-            Returns (pred_positions [B,k,4], logits [B,k,G*G])
+        Training (placed_blocks=None):
+            Returns pred_positions [B, k, 4]
 
-        Inference (occupancy=[B,G,G]):
-            Returns pred_positions [B,1,4]
-            Updates occupancy and placed_blocks in-place.
+        Inference (placed_blocks=list):
+            Returns pred_positions [B, 1, 4]
+            Updates placed_blocks in-place.
         """
-        h      = self.shared(x)          # [..., hidden]
-        logits = self.xy_head(h)          # [..., G*G]
+        h = self.shared(x)                           # [..., hidden]
 
-        if occupancy is None:
-            # ── Training mode: soft-argmax (differentiable) ────────
-            # Step 1: decide position via soft-argmax
-            weights = logits.softmax(dim=-1)                    # [B, k, G*G]
-            x = (weights * self.cell_gx).sum(dim=-1)            # [B, k]
-            y = (weights * self.cell_gy).sum(dim=-1)            # [B, k]
+        # Step 1: predict (x, y)
+        xy_raw = self.xy_head(h)                     # [..., 2]
+        pred_x = torch.sigmoid(xy_raw[..., 0])       # [...] ∈ (0, 1)
+        pred_y = torch.sigmoid(xy_raw[..., 1])       # [...] ∈ (0, 1)
 
-            # Preplaced blocks: override with hard-constrained coordinates
-            is_preplaced = token_features[..., 3] > 0
-            x = torch.where(is_preplaced, token_features[..., 6], x)
-            y = torch.where(is_preplaced, token_features[..., 7], y)
+        # Preplaced blocks: override predicted (x, y) with hard-constrained coords
+        is_preplaced = token_features[..., 3] > 0
+        pred_x = torch.where(is_preplaced, token_features[..., 6], pred_x)
+        pred_y = torch.where(is_preplaced, token_features[..., 7], pred_y)
 
-            # Step 2: decide shape conditioned on position
-            # ratio_head receives (h, x, y) so it can learn context-aware shapes:
-            # e.g. boundary block placed at left edge → wide shape fits better
-            xy = torch.stack([x, y], dim=-1)                    # [B, k, 2]
-            ratio_raw = self.ratio_head(torch.cat([h, xy], dim=-1))  # [B, k, 1]
+        # Step 2: predict ratio conditioned on (x, y), then derive (w, h)
+        ratio          = self._decode_ratio(h, pred_x, pred_y)
+        pred_w, pred_h = self._decode_size(token_features, ratio)
 
-            pred_w, pred_h = self._decode_size(token_features, ratio_raw)
-            pred_positions = torch.stack([x, y, pred_w, pred_h], dim=-1)
-            return pred_positions, logits
+        if placed_blocks is None:
+            # ── Training mode ──────────────────────────────────────────
+            return torch.stack([pred_x, pred_y, pred_w, pred_h], dim=-1)
 
         else:
-            # ── Inference mode (one step at a time) ────────────────
-            G      = self.G
+            # ── Inference mode: non-overlap search ────────────────────
             B      = x.shape[0]
             device = x.device
 
-            logits_step = logits[:, 0, :]          # [B, G*G]
-            tf_step     = token_features[:, 0, :]  # [B, 18]
-
-            # Grid-level occupancy mask
-            logits_masked = self.apply_occupancy_mask(logits_step, tf_step, occupancy)
-            # Per-sample fallback: if all positions masked, revert to unmasked
-            all_inf = ~torch.isfinite(logits_masked).any(dim=-1)  # [B]
-            if all_inf.any():
-                logits_masked[all_inf] = logits_step[all_inf]
-
-            # Step 1: decide position (argmax of masked logits)
-            final_x = torch.zeros(B, device=device)
-            final_y = torch.zeros(B, device=device)
+            final_x = pred_x[:, 0].clone()   # [B]
+            final_y = pred_y[:, 0].clone()   # [B]
+            w       = pred_w[:, 0]            # [B]
+            h_      = pred_h[:, 0]            # [B]
 
             for b in range(B):
-                is_pre = tf_step[b, 3].item() > 0   # is_preplaced
-
+                is_pre = token_features[b, 0, 3].item() > 0
                 if is_pre:
-                    final_x[b] = tf_step[b, 6]       # target_x
-                    final_y[b] = tf_step[b, 7]       # target_y
+                    # Preplaced blocks have already been inserted into
+                    # placed_blocks by TransformerFloorplan before the
+                    # autoregressive loop — do NOT append again.
+                    pass
                 else:
-                    if placed_blocks is not None:
-                        # Placeholder placement using unit square for overlap check;
-                        # real w, h computed after position is fixed below.
-                        idx = logits_masked[b].argmax().item()
-                        final_x[b] = (idx % G) / G
-                        final_y[b] = (idx // G) / G
-                    else:
-                        idx        = logits_masked[b].argmax().item()
-                        final_x[b] = (idx % G) / G
-                        final_y[b] = (idx // G) / G
-
-            # Step 2: decide shape conditioned on final position
-            h_step  = h[:, 0, :]                                       # [B, hidden]
-            xy_step = torch.stack([final_x, final_y], dim=-1)          # [B, 2]
-            ratio_raw_step = self.ratio_head(
-                torch.cat([h_step, xy_step], dim=-1)
-            ).unsqueeze(1)                                              # [B, 1, 1]
-
-            pred_w, pred_h = self._decode_size(token_features, ratio_raw_step)
-            pred_w = pred_w[:, 0]  # [B]
-            pred_h = pred_h[:, 0]  # [B]
-
-            # Exact overlap check now that real w, h are known
-            for b in range(B):
-                is_pre = tf_step[b, 3].item() > 0
-                if not is_pre and placed_blocks is not None:
-                    x_n, y_n, is_fb = place_with_exact_check(
-                        logits_masked[b].clone(),
+                    xn, yn, is_fb = find_nonoverlap_position(
+                        final_x[b].item(), final_y[b].item(),
+                        w[b].item(), h_[b].item(),
                         placed_blocks[b],
-                        pred_w[b].item(),
-                        pred_h[b].item(),
-                        G,
                     )
                     if is_fb:
                         self._fallback_count += 1
-                    final_x[b] = x_n
-                    final_y[b] = y_n
+                    final_x[b] = xn
+                    final_y[b] = yn
 
-            # Register placed blocks
-            for b in range(B):
-                if placed_blocks is not None:
                     placed_blocks[b].append((
                         final_x[b].item(), final_y[b].item(),
-                        pred_w[b].item(),  pred_h[b].item(),
+                        w[b].item(), h_[b].item(),
                     ))
 
             pred_positions = torch.stack(
-                [final_x, final_y, pred_w, pred_h], dim=-1
-            ).unsqueeze(1)   # [B, 1, 4]
-
-            # Update grid-level occupancy in-place
-            for b in range(B):
-                x_g = min(int(final_x[b].item() * G), G - 1)
-                y_g = min(int(final_y[b].item() * G), G - 1)
-                w_cells = max(1, min(G - x_g, int(math.ceil(pred_w[b].item() * G))))
-                h_cells = max(1, min(G - y_g, int(math.ceil(pred_h[b].item() * G))))
-                occupancy[b, y_g:y_g + h_cells, x_g:x_g + w_cells] = 1.0
-
-            return pred_positions  # [B, 1, 4]
+                [final_x, final_y, w, h_], dim=-1
+            ).unsqueeze(1)                    # [B, 1, 4]
+            return pred_positions
 
 
 # =============================================================================
@@ -378,42 +270,57 @@ class DiscreteRegressionHead(nn.Module):
 # =============================================================================
 
 if __name__ == "__main__":
-    print("=" * 55)
-    print("regression_head.py  —  smoke test (DiscreteRegressionHead)")
-    print("=" * 55)
+    print("=" * 60)
+    print("regression_head.py  —  smoke test (ContinuousRegressionHead)")
+    print("=" * 60)
 
-    G = GRID_SIZE
     B, k = 2, 55
     x  = torch.randn(B, k, D_MODEL)
-    tf = torch.zeros(B, k, 18)
+    tf = torch.zeros(B, k, 21)
     tf[:, :, 0] = 0.05   # area_target_norm
     tf[:, :, 1] = 1.0    # is_soft
 
-    head = DiscreteRegressionHead()
+    head = ContinuousRegressionHead()
     head.eval()
 
     # ── Training mode ─────────────────────────────────────────────
-    print("\n[1] Training mode (occupancy=None)")
+    print("\n[1] Training mode (placed_blocks=None)")
     with torch.no_grad():
-        pred_pos, logits = head(x, tf)
+        pred_pos = head(x, tf)
     assert pred_pos.shape == (B, k, 4), f"Expected ({B},{k},4), got {pred_pos.shape}"
-    assert logits.shape == (B, k, G * G), f"Expected ({B},{k},{G*G}), got {logits.shape}"
     print(f"  pred_positions : {tuple(pred_pos.shape)}")
-    print(f"  logits         : {tuple(logits.shape)}")
+    assert (pred_pos[..., 0] > 0).all() and (pred_pos[..., 0] < 1).all(), "x out of (0,1)"
+    assert (pred_pos[..., 1] > 0).all() and (pred_pos[..., 1] < 1).all(), "y out of (0,1)"
     assert (pred_pos[..., 2] > 0).all(), "w must be > 0"
     assert (pred_pos[..., 3] > 0).all(), "h must be > 0"
-    print("  w, h > 0       : OK")
+    print("  x, y in (0,1)  : OK")
+    print("  w, h > 0        : OK")
+
+    # ── Ratio clamp ───────────────────────────────────────────────
+    print("\n[2] Ratio clamp check")
+    ratio = pred_pos[..., 2] / pred_pos[..., 3]
+    assert (ratio >= MIN_RATIO - 1e-5).all(), f"ratio below MIN_RATIO={MIN_RATIO}"
+    assert (ratio <= MAX_RATIO + 1e-5).all(), f"ratio above MAX_RATIO={MAX_RATIO}"
+    print(f"  ratio ∈ [{MIN_RATIO}, {MAX_RATIO}]: OK  (actual min={ratio.min():.3f}, max={ratio.max():.3f})")
+
+    # ── Area conservation ─────────────────────────────────────────
+    print("\n[3] Area conservation (w * h == area_target_norm)")
+    area_pred = pred_pos[..., 2] * pred_pos[..., 3]
+    area_gt   = tf[..., 0].clamp(min=1e-12)
+    err = (area_pred - area_gt).abs().max().item()
+    assert err < 1e-5, f"Area mismatch: max err={err}"
+    print(f"  Max area error  : {err:.2e}  OK")
 
     # ── Backward pass ─────────────────────────────────────────────
-    print("\n[2] Backward pass")
-    x_train = torch.randn(B, k, D_MODEL, requires_grad=False)
-    pred_pos_t, logits_t = head(x_train, tf)
-    logits_t.sum().backward()
+    print("\n[4] Backward pass")
+    x_train  = torch.randn(B, k, D_MODEL, requires_grad=False)
+    pred_t   = head(x_train, tf)
+    pred_t.sum().backward()
     print("  Backward        : OK")
     head.zero_grad()
 
     # ── Preplaced override ────────────────────────────────────────
-    print("\n[3] Preplaced override")
+    print("\n[5] Preplaced override")
     tf_pre = tf.clone()
     tf_pre[:, 0, 3] = 1.0   # is_preplaced
     tf_pre[:, 0, 4] = 0.3   # target_w
@@ -421,28 +328,34 @@ if __name__ == "__main__":
     tf_pre[:, 0, 6] = 0.1   # target_x
     tf_pre[:, 0, 7] = 0.05  # target_y
     with torch.no_grad():
-        pred_pre, _ = head(x, tf_pre)
-    assert abs(pred_pre[0, 0, 0].item() - 0.1) < 1e-5,  "preplaced x mismatch"
+        pred_pre = head(x, tf_pre)
+    assert abs(pred_pre[0, 0, 0].item() - 0.1)  < 1e-5, "preplaced x mismatch"
     assert abs(pred_pre[0, 0, 1].item() - 0.05) < 1e-5, "preplaced y mismatch"
-    assert abs(pred_pre[0, 0, 2].item() - 0.3) < 1e-5,  "preplaced w mismatch"
-    assert abs(pred_pre[0, 0, 3].item() - 0.2) < 1e-5,  "preplaced h mismatch"
+    assert abs(pred_pre[0, 0, 2].item() - 0.3)  < 1e-5, "preplaced w mismatch"
+    assert abs(pred_pre[0, 0, 3].item() - 0.2)  < 1e-5, "preplaced h mismatch"
     print("  Override        : OK")
 
-    # ── Inference mode with occupancy ────────────────────────────
-    print("\n[4] Inference mode (occupancy=[B,G,G])")
-    x_step  = torch.randn(B, 1, D_MODEL)
-    tf_step = tf[:, :1, :]
-    occupancy = torch.zeros(B, G, G)
+    # ── Inference mode with non-overlap search ────────────────────
+    print("\n[6] Inference mode (placed_blocks=[])")
+    x_step      = torch.randn(B, 1, D_MODEL)
+    tf_step     = tf[:, :1, :]
+    placed_blocks = [[] for _ in range(B)]
     with torch.no_grad():
-        pred_step = head(x_step, tf_step, occupancy)
+        pred_step = head(x_step, tf_step, placed_blocks)
     assert pred_step.shape == (B, 1, 4), f"Expected ({B},1,4), got {pred_step.shape}"
-    print(f"  pred_step      : {tuple(pred_step.shape)}")
-    print(f"  occupancy sum  : {occupancy.sum().item():.0f}  (should be > 0)")
-    assert occupancy.sum() > 0, "Occupancy was not updated"
-    print("  Occupancy updated : OK")
+    assert all(len(pb) == 1 for pb in placed_blocks), "placed_blocks not updated"
+    print(f"  pred_step       : {tuple(pred_step.shape)}")
+    print(f"  placed_blocks   : {len(placed_blocks[0])} block(s) registered  OK")
+
+    # ── find_nonoverlap_position: guarantee no overlap ────────────
+    print("\n[7] find_nonoverlap_position exhaustive test")
+    placed = [(0.0, 0.0, 0.5, 0.5), (0.5, 0.0, 0.5, 0.5), (0.0, 0.5, 0.5, 0.5)]
+    x_n, y_n, is_fb = find_nonoverlap_position(0.0, 0.0, 0.5, 0.5, placed)
+    assert not is_fb, "Should find valid position (bottom-right quadrant is free)"
+    assert not _has_overlap(x_n, y_n, 0.5, 0.5, placed), "Returned position still overlaps"
+    print(f"  Placed position : ({x_n:.3f}, {y_n:.3f})  is_fallback={is_fb}  OK")
 
     total = sum(p.numel() for p in head.parameters())
     print(f"\nParameters: {total:,}")
-
     print("\nSmoke test passed.")
-    print("=" * 55)
+    print("=" * 60)

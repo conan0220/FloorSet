@@ -641,7 +641,7 @@ class ContestEvaluator:
                     pins_pos,
                     area_target,
                     target_pos,
-                    median_runtime=1.0
+                    median_runtime=runtime  # runtime_factor=1.0, no runtime penalty
                 )
                 
                 results.append(TestResult(

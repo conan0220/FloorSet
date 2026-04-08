@@ -87,7 +87,6 @@ LAMBDA_GROUPING   = 0.1     # weight for V_grouping  (cluster centroid distance)
 LAMBDA_MIB        = 0.1     # weight for V_mib       (macro-in-block size deviation)
 LAMBDA_BOUNDARY   = 0.1     # weight for V_boundary  (boundary gap penalty)
 LAMBDA_OVERLAP    = 50.0    # weight for V_overlap   (pairwise overlap area)
-LAMBDA_COORD      = 1.0     # weight for L_coord     (L1 position loss)
 
 # Ratio regularisation: penalise log(w/h)² to prevent degenerate thin-strip blocks.
 # Weight decays linearly from LAMBDA_RATIO_REG → 0 over RATIO_REG_DECAY_EPOCHS epochs,

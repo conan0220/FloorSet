@@ -1581,22 +1581,27 @@ def main():
                        help='Save solutions (positions) to separate file')
     parser.add_argument('--log-blocks', action='store_true',
                        help='Print per-block (x, y, w, h) for each test case')
-    
+    parser.add_argument('--viz', action='store_true',
+                       help='Save floorplan visualizations (default: off)')
+
     args = parser.parse_args()
-    
+
     if args.info:
         print_contest_info()
         return
-    
+
     if args.evaluate:
         evaluator = ContestEvaluator(args.data_path, verbose=True)
         test_ids = [args.test_id] if args.test_id is not None else None
 
-        optimizer_stem = Path(args.evaluate).stem
-        viz_dir = Path(args.output).parent / f"{optimizer_stem}_viz" if args.output else \
-                  Path(args.evaluate).parent / f"{optimizer_stem}_viz"
-        viz_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Saving visualizations to: {viz_dir}/")
+        if args.viz:
+            optimizer_stem = Path(args.evaluate).stem
+            viz_dir = Path(args.output).parent / f"{optimizer_stem}_viz" if args.output else \
+                      Path(args.evaluate).parent / f"{optimizer_stem}_viz"
+            viz_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Saving visualizations to: {viz_dir}/")
+        else:
+            viz_dir = None
 
         result = evaluator.evaluate(args.evaluate, test_ids, viz_dir=viz_dir)
         

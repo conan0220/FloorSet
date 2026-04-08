@@ -28,7 +28,7 @@ sys.path.insert(0, str(_REPO_ROOT / "iccad2026contest"))
 from config import (
     BATCH_SIZE, MAX_EPOCHS, PATIENCE, LEARNING_RATE, WARMUP_STEPS,
     GRAD_CLIP_NORM, LAMBDA_WIRELENGTH, LAMBDA_AREA,
-    LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP, LAMBDA_COORD,
+    LAMBDA_GROUPING, LAMBDA_MIB, LAMBDA_BOUNDARY, LAMBDA_OVERLAP,
     VALIDATE_EVERY, VIZ_BLOCK_SIZES, RAW_FEATURE_DIM,
     LOGS_DIR, CHECKPOINT_DIR, CONTEST_DIR,
     CACHE_DIR, CACHE_PRELOAD,
@@ -48,7 +48,6 @@ from model.transformer_floorplan import TransformerFloorplan
 from loss.wirelength_loss import wirelength_loss
 from loss.area_loss       import area_loss
 from loss.violation_loss  import violation_loss
-from loss.coord_loss      import coord_loss
 from inference            import ar_inference
 
 
@@ -210,7 +209,6 @@ def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0)
     # De-normalise for HPWL / area losses (raw pixel scale)
     pred_raw = pred_norm * crefs.view(-1, 1, 1)  # [B, k, 4]
 
-    l_coord = coord_loss(pred_norm, gtn, cons, kpm)
     l_wl    = wirelength_loss(pred_raw, wiu, pins, p2b, hbase)
     l_area  = area_loss(pred_raw, abase)
     l_grouping, l_mib, l_boundary, l_overlap = violation_loss(pred_norm, cons)
@@ -228,8 +226,7 @@ def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0)
     else:
         l_ratio_reg = pred_norm.new_zeros(1).squeeze()
 
-    total = (LAMBDA_COORD       * l_coord
-             + LAMBDA_WIRELENGTH * l_wl
+    total = (LAMBDA_WIRELENGTH * l_wl
              + LAMBDA_AREA       * l_area
              + LAMBDA_GROUPING   * l_grouping
              + LAMBDA_MIB        * l_mib
@@ -239,7 +236,6 @@ def compute_batch_loss(model, batch: dict, device: torch.device, epoch: int = 0)
 
     return total, {
         "total":      total.item(),
-        "coord":      l_coord.item(),
         "wirelength": l_wl.item(),
         "area":       l_area.item(),
         "grouping":   l_grouping.item(),

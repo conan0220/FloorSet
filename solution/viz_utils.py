@@ -49,12 +49,16 @@ def save_floorplan_viz(
     title: str = "",
     loss_parts: dict = None,  # keys: total, coord, wirelength, area, grouping, mib, boundary, overlap
     constraints=None,         # [k, 5] tensor (optional)
+    b2b_conn=None,            # [e, 3] tensor (block_i, block_j, weight) — optional
+    p2b_conn=None,            # [e, 3] tensor (pin_idx, block_idx, weight) — optional
+    pins_pos=None,            # [p, 2] tensor (x, y) — optional
 ):
     """
     Save a side-by-side GT vs Predicted floorplan figure.
 
     Blocks are coloured by type when constraints is provided.
     A legend and loss summary are added automatically.
+    When b2b_conn / p2b_conn / pins_pos are provided, nets and pins are drawn.
     """
     def _iter(positions):
         """Yield (x, y, w, h) regardless of whether positions is a tensor or list."""
@@ -64,6 +68,59 @@ def save_floorplan_viz(
                 yield tuple(row.tolist())
             else:
                 yield tuple(row)
+
+    def _draw_nets(ax, positions_list):
+        """Draw b2b wires, p2b wires, and pin dots on ax."""
+        # Precompute block centers
+        centers = [(x + w / 2, y + h / 2) for x, y, w, h in positions_list]
+
+        # ── b2b ──────────────────────────────────────────────────────
+        if b2b_conn is not None:
+            conn = b2b_conn
+            if isinstance(conn, torch.Tensor):
+                conn = conn.tolist()
+            # normalise weights for alpha
+            weights = [e[2] for e in conn if e[0] >= 0]
+            max_w = max(weights) if weights else 1.0
+            for bi, bj, w in conn:
+                bi, bj = int(bi), int(bj)
+                if bi < 0 or bj < 0 or bi >= block_count or bj >= block_count:
+                    continue
+                alpha = max(0.05, min(0.7, w / max(max_w, 1e-8)))
+                cx_i, cy_i = centers[bi]
+                cx_j, cy_j = centers[bj]
+                ax.plot([cx_i, cx_j], [cy_i, cy_j],
+                        color="royalblue", linewidth=0.5, alpha=alpha, zorder=1)
+
+        # ── p2b ──────────────────────────────────────────────────────
+        if p2b_conn is not None and pins_pos is not None:
+            conn = p2b_conn
+            pins = pins_pos
+            if isinstance(conn, torch.Tensor):
+                conn = conn.tolist()
+            if isinstance(pins, torch.Tensor):
+                pins = pins.tolist()
+            n_pins = len(pins)
+            weights = [e[2] for e in conn if e[0] >= 0]
+            max_w = max(weights) if weights else 1.0
+            for pi, bi, w in conn:
+                pi, bi = int(pi), int(bi)
+                if pi < 0 or bi < 0 or pi >= n_pins or bi >= block_count:
+                    continue
+                alpha = max(0.05, min(0.7, w / max(max_w, 1e-8)))
+                px, py = pins[pi]
+                cx, cy = centers[bi]
+                ax.plot([px, cx], [py, cy],
+                        color="darkorange", linewidth=0.5, alpha=alpha, zorder=1)
+
+        # ── pins ─────────────────────────────────────────────────────
+        if pins_pos is not None:
+            pins = pins_pos
+            if isinstance(pins, torch.Tensor):
+                pins = pins.tolist()
+            px = [p[0] for p in pins if p[0] >= 0]
+            py = [p[1] for p in pins if p[1] >= 0]
+            ax.scatter(px, py, s=8, c="darkorange", zorder=3, marker="x", linewidths=0.8)
 
     # Build per-block colors
     if constraints is not None:
@@ -95,6 +152,10 @@ def save_floorplan_viz(
                         ha="center", va="center",
                         fontsize=6, fontweight="bold", color="black",
                     )
+        # Draw connectivity nets and pins (if provided)
+        if b2b_conn is not None or p2b_conn is not None or pins_pos is not None:
+            _draw_nets(ax, list(_iter(positions)))
+
         ax.autoscale()
         ax.set_aspect("equal")
         ax.set_xlabel("X")

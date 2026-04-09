@@ -688,6 +688,7 @@ class ContestEvaluator:
         timeout: float = 60.0,
         viz_dir: Optional[Path] = None,
         compute_loss: bool = False,
+        draw_nets: bool = False,
     ) -> EvaluationResult:
         """Run full evaluation."""
         self._load_dataset()
@@ -774,6 +775,9 @@ class ContestEvaluator:
                         out_path=viz_dir / f"test_{idx:03d}.png",
                         title=title,
                         constraints=constraints[:block_count] if constraints is not None else None,
+                        b2b_conn=b2b_conn if draw_nets else None,
+                        p2b_conn=p2b_conn if draw_nets else None,
+                        pins_pos=pins_pos if draw_nets else None,
                     )
 
             except Exception as e:
@@ -1690,6 +1694,8 @@ def main():
                        help='Print per-block (x, y, w, h) for each test case')
     parser.add_argument('--viz', action='store_true',
                        help='Save floorplan visualizations (default: off)')
+    parser.add_argument('--nets', action='store_true',
+                       help='Draw b2b / p2b connectivity and pins in viz (requires --viz)')
     parser.add_argument('--checkpoint', type=str, default=None,
                        help='Checkpoint filename to load (e.g. best.pt, latest.pt); '
                             'default: best.pt → latest.pt')
@@ -1716,7 +1722,8 @@ def main():
             viz_dir = None
 
         result = evaluator.evaluate(args.evaluate, test_ids, viz_dir=viz_dir,
-                                    compute_loss=args.loss)
+                                    compute_loss=args.loss,
+                                    draw_nets=args.nets)
         
         # Print per-case detailed breakdown
         print("\n" + "=" * 100)

@@ -22,6 +22,9 @@ python evaluate_detail.py --evaluate my_optimizer.py
 python evaluate_detail.py --evaluate my_optimizer.py --test-id 94            # 單一案例
 python evaluate_detail.py --evaluate my_optimizer.py --test-id 94 --log-blocks  # 輸出每個 block 的 x,y,w,h
 python evaluate_detail.py --evaluate my_optimizer.py --viz                   # 同時輸出視覺化圖片
+python evaluate_detail.py --evaluate my_optimizer.py --viz --nets            # 視覺化圖片加上 b2b/p2b 連線與 pin 位置
+python evaluate_detail.py --evaluate my_optimizer.py --test-id 94 --loss    # 輸出加權後的各項 training loss
+python evaluate_detail.py --evaluate my_optimizer.py --checkpoint latest.pt # 指定載入的 checkpoint
 ```
 
 ---

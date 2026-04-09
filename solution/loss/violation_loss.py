@@ -101,25 +101,28 @@ def violation_loss(
 
     # ── V_boundary ─────────────────────────────────────────────────
     # Penalise the gap between a boundary block's relevant edge and the
-    # canvas edge (0 or 1 in normalised space).  Using fixed canvas edges
-    # gives a stable training signal regardless of the predicted bounding
-    # box, which would otherwise be very small when boundary blocks are
-    # placed last in the autoregressive sequence.
+    # floorplan bounding box edge (not the canvas edge).
     #
-    # Bit layout (matches violation_loss convention):
-    #   bit 0 (1): left  → x_left  must touch x = 0
-    #   bit 1 (2): right → x_right must touch x = 1
-    #   bit 2 (4): bot   → y_bot   must touch y = 0
-    #   bit 3 (8): top   → y_top   must touch y = 1
+    # Bit layout:
+    #   bit 0 (1): left  → x_left  must touch bbox_xmin
+    #   bit 1 (2): right → x_right must touch bbox_xmax
+    #   bit 2 (4): bot   → y_bot   must touch bbox_ymin
+    #   bit 3 (8): top   → y_top   must touch bbox_ymax
     has_left  = (bcode & 1).float()                                       # [B, k]
     has_right = ((bcode >> 1) & 1).float()
     has_bot   = ((bcode >> 2) & 1).float()
     has_top   = ((bcode >> 3) & 1).float()
 
-    pen_left  = x_left.clamp(min=0)            * has_left   # gap from x = 0
-    pen_right = (1.0 - x_right).clamp(min=0)  * has_right  # gap from x = 1
-    pen_bot   = y_bot.clamp(min=0)             * has_bot    # gap from y = 0
-    pen_top   = (1.0 - y_top).clamp(min=0)    * has_top    # gap from y = 1
+    # Broadcast bbox edges [B] → [B, 1] for subtraction with [B, k]
+    bxmin = bbox_xmin.unsqueeze(1)   # [B, 1]
+    bxmax = bbox_xmax.unsqueeze(1)   # [B, 1]
+    bymin = bbox_ymin.unsqueeze(1)   # [B, 1]
+    bymax = bbox_ymax.unsqueeze(1)   # [B, 1]
+
+    pen_left  = (x_left  - bxmin).clamp(min=0) * has_left   # gap from bbox left
+    pen_right = (bxmax   - x_right).clamp(min=0) * has_right # gap from bbox right
+    pen_bot   = (y_bot   - bymin).clamp(min=0) * has_bot     # gap from bbox bottom
+    pen_top   = (bymax   - y_top).clamp(min=0) * has_top     # gap from bbox top
 
     n_boundary = (bcode > 0).float().sum().clamp(min=1)
     v_boundary = (pen_left + pen_right + pen_bot + pen_top).sum() / n_boundary
